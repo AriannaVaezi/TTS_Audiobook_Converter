@@ -1,0 +1,30 @@
+# ==============================================================================
+# Requirements for ff_gen Audiobook & TTS Pipeline
+# (audioconverter.py, hybrid_audioconverter.py, generate_f5tts.py, new_text_parser.py)
+# ==============================================================================
+
+# Extra index URL for CUDA 12.1 GPU acceleration with PyTorch on Windows
+--extra-index-url https://download.pytorch.org/whl/cu121
+
+# Deep Learning Framework
+torch>=2.2.0
+torchaudio>=2.2.0
+
+# Zero-Shot Voice Cloning & Text-to-Speech
+f5-tts>=0.1.0
+
+# Audio file I/O & HTTP API requests (for Kokoro API)
+requests>=2.31.0
+soundfile>=0.12.1
+
+# Web scraping (url_to_txt.py / batch_url_to_txt.py)
+# After installing: playwright install chromium
+playwright>=1.40.0
+beautifulsoup4>=4.12.0
+
+# EPUB & PDF extraction (ebook_to_txt.py)
+ebooklib>=0.18
+pymupdf>=1.24.0
+
+# Protobuf compatibility constraint (prevents breaking Google AI & gRPC dependencies)
+protobuf>=5.26.1,<6.0.0dev

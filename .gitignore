@@ -1,0 +1,57 @@
+# ==============================================================================
+# Git Ignore Configuration for Audiobook Generator
+# ==============================================================================
+
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Virtual Environment folder (machine-specific binaries - created via setup_env.bat)
+.venv/
+venv/
+env/
+ENV/
+
+# Exclude all copyrighted / user raw book texts (keep empty raw_txt directory)
+raw_txt/*
+!raw_txt/.gitkeep
+parsed_chapters/
+tagged_chapters/
+*_chapters/
+chapters.txt
+replacements.json
+characters.json
+tag_mappings.json
+
+# Audio & media generation outputs
+*.wav
+*.mp3
+*.zip
+*.png
+*_audiobook_output/
+finished/
+finished_audiobooks/
+finished stuff/
+complete/
+test_audiobook_output/
+under_review_*
+old_code/
+wavs/
+F5-TTS/
+test_code/
+
+# Legacy / unused files (excluded from GitHub submission)
+*.txt
+!requirements.txt
+# Old converter files (replaced by url_to_txt.py / ebook_to_txt.py)
+convertor.py
+batch.py
+generate_f5tts.py
+
+# OS & IDE metadata
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
