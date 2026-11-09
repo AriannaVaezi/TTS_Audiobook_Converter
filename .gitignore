@@ -36,6 +36,7 @@ finished_audiobooks/
 finished stuff/
 complete/
 test_audiobook_output/
+comparison_test_output/
 under_review_*
 old_code/
 wavs/

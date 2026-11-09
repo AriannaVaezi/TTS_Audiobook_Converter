@@ -612,25 +612,26 @@ def process_hybrid_chapter(txt_filename, characters_map, master_output_dir, tag_
             tf.write(f" ABSOLUTE TIMESTAMP LOG: {base_name}\n")
             tf.write(f" Output File: {os.path.basename(final_mp3)}\n")
             tf.write("======================================================================\n")
-            used_characters = {
-                meta["character"]
+            used_chars_lower = {
+                str(meta["character"]).strip().lower()
                 for meta in chunk_metadata
                 if meta["character"] != "DIVIDER"
             }
             tf.write("VOICE ROSTER USED:\n")
             for c_name, c_info in characters_map.items():
-                if c_name not in used_characters:
+                if c_name.strip().lower() not in used_chars_lower:
                     continue
+                disp = c_info.get("display_name", c_name.title())
                 c_eng = c_info.get("engine", "kokoro").upper()
-                if c_eng == "KOKORO":
+                if c_eng in ["F5TTS", "F5-TTS"]:
+                    ref_f = os.path.basename(c_info.get("ref_audio", "sample.wav"))
+                    tf.write(f"  • [{disp}] (F5-TTS): ref={ref_f}\n")
+                else:
                     v_str = c_info.get("voice", "af_bella")
                     p_val = float(c_info.get("pitch", 1.0))
                     if p_val != 1.0:
                         v_str += f" (pitch: {p_val})"
-                    tf.write(f"  • [{c_name}] (KOKORO): {v_str}\n")
-                else:
-                    ref_f = os.path.basename(c_info.get("ref_audio", "sample.wav"))
-                    tf.write(f"  • [{c_name}] (F5-TTS): {ref_f}\n")
+                    tf.write(f"  • [{disp}] (KOKORO): {v_str}\n")
             tf.write("======================================================================\n\n")
 
             for meta in chunk_metadata:

@@ -76,6 +76,66 @@ STOP_WORDS = {
 }
 # ========================================================
 
+# ==================== EMOTION & TONE DETECTION ====================
+EMOTION_KEYWORDS = {
+    "whisper": {
+        "verbs": ["whispered", "whispers", "muttered", "mutters", "murmured", "murmurs", "breathed"],
+        "adverbs": ["quietly", "softly", "in a whisper", "under his breath", "under her breath", "hushed"]
+    },
+    "shout": {
+        "verbs": ["shouted", "shouts", "yelled", "yells", "screamed", "screams", "barked", "barks", "howled", "bellowed"],
+        "adverbs": ["loudly", "at the top of his lungs", "at the top of her lungs"]
+    },
+    "angry": {
+        "verbs": ["snapped", "snaps", "growled", "growls", "hissed", "hisses", "fumed", "spat"],
+        "adverbs": ["angrily", "furiously", "harshly", "sharply", "bitterly", "fiercely"]
+    },
+    "sad": {
+        "verbs": ["cried", "cries", "sobbed", "sobs", "whimpered", "whimpers", "mourned", "sighed", "sighs"],
+        "adverbs": ["sadly", "mournfully", "miserably", "tearfully", "wistfully"]
+    },
+    "happy": {
+        "verbs": ["laughed", "laughs", "chuckled", "chuckles", "giggled", "giggles", "grinned", "beamed"],
+        "adverbs": ["happily", "cheerfully", "brightly", "gleefully", "warmly", "joyfully"]
+    },
+    "excited": {
+        "verbs": ["gasped", "gasps", "squealed", "squeals", "exclaimed", "exclaims"],
+        "adverbs": ["excitedly", "breathlessly", "eagerly"]
+    },
+    "calm": {
+        "verbs": [],
+        "adverbs": ["calmly", "evenly", "flatly", "coolly", "dryly", "composedly"]
+    }
+}
+
+
+def detect_dialogue_tone(paragraph, quote_span):
+    """
+    Detects emotional tone (whisper, shout, angry, sad, happy, excited, calm)
+    from adjacent speech verbs, adverbs, and punctuation.
+    Returns emotion string or '' if neutral.
+    """
+    start, end = quote_span
+    pre = paragraph[max(0, start - 70):start].lower()
+    post = paragraph[end:min(len(paragraph), end + 70)].lower()
+    snippet = f"{pre} {post}"
+
+    for emotion, patterns in EMOTION_KEYWORDS.items():
+        for verb in patterns.get("verbs", []):
+            if re.search(rf"\b{re.escape(verb)}\b", snippet):
+                return emotion
+        for adv in patterns.get("adverbs", []):
+            if re.search(rf"\b{re.escape(adv)}\b", snippet):
+                return emotion
+
+    # Check punctuation clues inside quote if ending in !? or ?!
+    q_text = paragraph[start:end]
+    if "!?" in q_text or "?!" in q_text:
+        return "excited"
+
+    return ""
+
+
 
 def check_ollama_service(url=DEFAULT_OLLAMA_URL):
     """
@@ -202,12 +262,13 @@ def discover_characters_in_text(text, roster):
 
 # ==================== SCRIPT FORMAT PARSER ====================
 
-def tag_script_format(text):
+def tag_script_format(text, detect_tone=False):
     """
     Tags dialogue formatted as script/screenplay style:
       [Character]: Dialogue...
       or
       Character: Dialogue...
+      or with parenthetical directions: Character (whispering): Dialogue...
     Leaves non-dialogue lines (narration/stage directions) untagged.
     Returns (tagged_text, set_of_character_names).
     """
@@ -215,7 +276,9 @@ def tag_script_format(text):
     tagged_lines = []
     characters_found = set()
 
-    script_pattern = re.compile(r"^(?:\[\s*([a-zA-Z0-9_\'\-\s]+)\s*\]|([a-zA-Z0-9_\'\-]+))\s*:\s*(.*)$")
+    script_pattern = re.compile(
+        r"^(?:\[\s*([a-zA-Z0-9_\'\-\s]+?)\s*(?:\((.*?)\))?\s*\]|([a-zA-Z0-9_\'\-]+?)\s*(?:\((.*?)\))?)\s*:\s*(.*)$"
+    )
 
     for line in lines:
         stripped = line.strip()
@@ -229,9 +292,17 @@ def tag_script_format(text):
 
         match = script_pattern.match(stripped)
         if match:
-            raw_speaker = match.group(1) or match.group(2)
+            raw_speaker = match.group(1) or match.group(3)
+            parenthetical = (match.group(2) or match.group(4) or "").lower()
             speaker = clean_character_name(raw_speaker)
-            dialogue = match.group(3).strip()
+            dialogue = match.group(5).strip()
+
+            tone = ""
+            if detect_tone and parenthetical:
+                for emo in EMOTION_KEYWORDS:
+                    if emo in parenthetical:
+                        tone = emo
+                        break
 
             if speaker and dialogue:
                 characters_found.add(speaker)
@@ -239,7 +310,10 @@ def tag_script_format(text):
                     dialogue_quoted = f'"{dialogue}"'
                 else:
                     dialogue_quoted = dialogue
-                tagged_lines.append(f"[{speaker}] {dialogue_quoted} [/{speaker}]")
+
+                tag_open = f"[{speaker}:{tone}]" if tone else f"[{speaker}]"
+                tag_close = f"[/{speaker}:{tone}]" if tone else f"[/{speaker}]"
+                tagged_lines.append(f"{tag_open} {dialogue_quoted} {tag_close}")
             else:
                 tagged_lines.append(stripped)
         else:
@@ -374,7 +448,7 @@ def attribute_paragraph_speaker(paragraph, matches, roster, active_speakers, use
     return valid[0] if valid else "Unknown"
 
 
-def tag_prose_chapter(text, roster=None, use_llm=False, model=DEFAULT_MODEL, url=DEFAULT_OLLAMA_URL):
+def tag_prose_chapter(text, roster=None, use_llm=False, model=DEFAULT_MODEL, url=DEFAULT_OLLAMA_URL, detect_tone=False):
     """
     High-performance prose dialogue tagger:
       1. Discovers any new characters in dialogue tags.
@@ -449,7 +523,11 @@ def tag_prose_chapter(text, roster=None, use_llm=False, model=DEFAULT_MODEL, url
         for m in reversed(matches):
             start, end = m.span()
             q_content = m.group(1).strip()
-            replacement = f'[{speaker}] "{q_content}" [/{speaker}]'
+            tone = detect_dialogue_tone(p_stripped, (start, end)) if detect_tone else ""
+            if tone:
+                replacement = f'[{speaker}:{tone}] "{q_content}" [/{speaker}:{tone}]'
+            else:
+                replacement = f'[{speaker}] "{q_content}" [/{speaker}]'
             tagged_p = tagged_p[:start] + replacement + tagged_p[end:]
             total_quotes_tagged += 1
 
@@ -508,10 +586,51 @@ def sync_tag_mappings(discovered_tags, tag_mappings_file=TAG_MAPPINGS_FILE):
     return added
 
 
+def find_character_audio_sample(char_name, search_dirs=("wavs", "wav", ".")):
+    """
+    Searches known audio directories for a reference .wav matching the character name.
+    Also detects any emotional reference clips (e.g. Hero_whisper.wav, Hero_shout.wav).
+    Returns (primary_sample_path, dict_of_emotions).
+    """
+    c_clean = char_name.strip()
+    primary = None
+    emotions = {}
+
+    for d in search_dirs:
+        if not os.path.exists(d):
+            continue
+        for f in os.listdir(d):
+            if not f.lower().endswith((".wav", ".mp3", ".flac")):
+                continue
+            base = os.path.splitext(f)[0]
+            # Exact base match: e.g. Hero.wav
+            if base.lower() == c_clean.lower():
+                primary = os.path.join(d, f).replace("\\", "/")
+            # Emotional variant match: e.g. Hero_shout.wav, Hero-whisper.wav
+            for emo in list(EMOTION_KEYWORDS.keys()) + ["shouting", "whispering"]:
+                if base.lower() in [f"{c_clean.lower()}_{emo}", f"{c_clean.lower()}-{emo}"]:
+                    ref_path = os.path.join(d, f).replace("\\", "/")
+                    ref_text = ""
+                    txt_candidate = os.path.join(d, f"{base}.txt")
+                    if os.path.exists(txt_candidate):
+                        try:
+                            with open(txt_candidate, "r", encoding="utf-8") as tf:
+                                ref_text = tf.read().strip()
+                        except Exception:
+                            pass
+                    emotions[emo] = {
+                        "ref_audio": ref_path,
+                        "ref_text": ref_text
+                    }
+
+    return primary, emotions
+
+
 def sync_characters_json(discovered_characters, characters_file=CHARACTERS_FILE):
     """
     Synchronizes discovered character names with characters.json.
-    Adds clean template profiles for newly discovered characters.
+    Automatically detects reference audio samples in 'wavs/' to auto-configure F5-TTS,
+    and falls back to distinct Kokoro voices if no custom voice sample is present.
     """
     if os.path.exists(characters_file):
         try:
@@ -539,19 +658,45 @@ def sync_characters_json(discovered_characters, characters_file=CHARACTERS_FILE)
         if c_lower in ["narrator", "divider", "unknown"]:
             continue
 
-        if c_lower not in existing_lower:
-            assigned_voice = DEFAULT_KOKORO_VOICES[voice_idx % len(DEFAULT_KOKORO_VOICES)]
-            voice_idx += 1
+        ref_sample, emotions = find_character_audio_sample(char_name)
 
-            config[char_name] = {
-                "engine": "kokoro",
-                "voice": assigned_voice,
-                "pitch": 1.0,
-                "speed": 1.0,
-                "description": f"Auto-detected character '{char_name}'. Change engine to 'f5tts' for voice cloning or customize voice."
-            }
-            newly_added.append(char_name)
+        if c_lower not in existing_lower:
+            if ref_sample:
+                profile = {
+                    "engine": "f5tts",
+                    "ref_audio": ref_sample,
+                    "ref_text": "",
+                    "pitch": 1.0,
+                    "speed": 1.0,
+                    "steps": 16,
+                    "description": f"Auto-configured F5-TTS voice using '{os.path.basename(ref_sample)}'."
+                }
+                if emotions:
+                    profile["emotions"] = emotions
+                config[char_name] = profile
+                newly_added.append((char_name, "F5-TTS (auto-detected ref wav)"))
+            else:
+                assigned_voice = DEFAULT_KOKORO_VOICES[voice_idx % len(DEFAULT_KOKORO_VOICES)]
+                voice_idx += 1
+                config[char_name] = {
+                    "engine": "kokoro",
+                    "voice": assigned_voice,
+                    "pitch": 1.0,
+                    "speed": 1.0,
+                    "description": f"Auto-detected character '{char_name}'. Change engine to 'f5tts' for voice cloning or customize voice."
+                }
+                newly_added.append((char_name, f"Kokoro ({assigned_voice})"))
             existing_lower[c_lower] = char_name
+        else:
+            canon_key = existing_lower[c_lower]
+            if ref_sample and config[canon_key].get("engine", "").lower() != "f5tts":
+                print(f"  [+] Note: Found '{ref_sample}' for existing character [{canon_key}]. Set engine to 'f5tts' in {characters_file} to enable.")
+            if emotions:
+                curr_emo = config[canon_key].setdefault("emotions", {})
+                for ek, ev in emotions.items():
+                    if ek not in curr_emo:
+                        curr_emo[ek] = ev
+                        print(f"  [+] Attached emotion reference sample [{ek}: {ev['ref_audio']}] to character [{canon_key}].")
 
     with open(characters_file, "w", encoding="utf-8") as f:
         json.dump(config, f, indent=4)
@@ -561,7 +706,7 @@ def sync_characters_json(discovered_characters, characters_file=CHARACTERS_FILE)
 
 # ==================== BATCH PROCESSING API ====================
 
-def batch_tag_files(file_paths, dialogue_format="prose", model=DEFAULT_MODEL, url=DEFAULT_OLLAMA_URL, output_dir=DEFAULT_OUTPUT_DIR):
+def batch_tag_files(file_paths, dialogue_format="prose", model=DEFAULT_MODEL, url=DEFAULT_OLLAMA_URL, output_dir=DEFAULT_OUTPUT_DIR, detect_tone=True):
     """
     Programmatic entry point called by new_text_parser.py or external scripts.
     dialogue_format can be:
@@ -587,22 +732,32 @@ def batch_tag_files(file_paths, dialogue_format="prose", model=DEFAULT_MODEL, ur
         if not os.path.exists(fpath):
             continue
 
-        bname = os.path.basename(fpath)
-        out_path = os.path.join(output_dir, bname)
-        print(f"\n[{idx}/{len(file_paths)}] Processing: '{bname}'")
+        # Preserve book subfolder structure if inside parsed_chapters/<Book>/...
+        norm_fpath = os.path.normpath(fpath)
+        parts = norm_fpath.split(os.sep)
+        if "parsed_chapters" in parts:
+            p_idx = parts.index("parsed_chapters")
+            sub_path = os.sep.join(parts[p_idx + 1:])
+            out_path = os.path.join(output_dir, sub_path)
+        else:
+            out_path = os.path.join(output_dir, os.path.basename(fpath))
+
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        print(f"\n[{idx}/{len(file_paths)}] Processing: '{os.path.basename(fpath)}'")
 
         with open(fpath, "r", encoding="utf-8") as f:
             raw_text = f.read()
 
         if dialogue_format.lower() == "script":
-            tagged, chars = tag_script_format(raw_text)
+            tagged, chars = tag_script_format(raw_text, detect_tone=detect_tone)
         else:
             tagged, chars = tag_prose_chapter(
                 text=raw_text,
                 roster=roster,
                 use_llm=use_llm,
                 model=model,
-                url=url
+                url=url,
+                detect_tone=detect_tone
             )
 
         with open(out_path, "w", encoding="utf-8") as f:
@@ -633,35 +788,49 @@ def batch_tag_files(file_paths, dialogue_format="prose", model=DEFAULT_MODEL, ur
 
 # ==================== INTERACTIVE CLI ====================
 
-def select_input_file():
-    """Lists files in parsed_chapters or raw_txt and lets the user select one."""
+def select_input_files():
+    """
+    Lists files in parsed_chapters/** and raw_txt/** recursively.
+    Supports selecting single file or [0] to process all chapters in chapters.txt.
+    Returns list of file paths.
+    """
     search_dirs = ["parsed_chapters", "raw_txt"]
     candidates = []
     for d in search_dirs:
         if os.path.exists(d):
-            files = sorted(glob.glob(os.path.join(d, "*.txt")))
+            files = sorted(glob.glob(os.path.join(d, "**", "*.txt"), recursive=True))
             candidates.extend(files)
+
+    if not candidates and os.path.exists(MANIFEST_FILE):
+        with open(MANIFEST_FILE, "r", encoding="utf-8") as mf:
+            return [line.strip() for line in mf if line.strip() and not line.startswith("#")]
 
     if not candidates:
         print("[!] No .txt files found in 'parsed_chapters/' or 'raw_txt/'.")
         path = input("Enter path to your text file manually: ").strip()
         if os.path.exists(path):
-            return path
+            return [path]
         print("[X] File does not exist.")
         sys.exit(1)
 
     print("\nAvailable files to tag:")
+    if os.path.exists(MANIFEST_FILE):
+        print(f"  [00] Process ALL chapters listed in '{MANIFEST_FILE}'")
     for idx, path in enumerate(candidates, 1):
         print(f"  [{idx:02d}] {path}")
 
-    choice = input(f"\nSelect file number [1-{len(candidates)}] (default 1): ").strip()
+    choice = input(f"\nSelect file number [0-{len(candidates)}] (default 1): ").strip()
+    if choice in ("0", "00", "all") and os.path.exists(MANIFEST_FILE):
+        with open(MANIFEST_FILE, "r", encoding="utf-8") as mf:
+            return [line.strip() for line in mf if line.strip() and not line.startswith("#")]
+
     try:
         num = int(choice) if choice else 1
         if 1 <= num <= len(candidates):
-            return candidates[num - 1]
+            return [candidates[num - 1]]
     except ValueError:
         pass
-    return candidates[0]
+    return [candidates[0]]
 
 
 def main():
@@ -675,6 +844,7 @@ def main():
     parser.add_argument("--model", "-m", type=str, default=DEFAULT_MODEL, help="Ollama model name (default: qwen2.5:7b).")
     parser.add_argument("--url", "-u", type=str, default=DEFAULT_OLLAMA_URL, help="Ollama server URL.")
     parser.add_argument("--output", "-o", type=str, help="Destination directory or file path for tagged text.")
+    parser.add_argument("--detect-tone", action="store_true", help="Detect dialogue emotions (whisper, shout, angry, etc.) and tag as [Speaker:tone].")
     args = parser.parse_args()
 
     # 1. Determine files to process
@@ -684,8 +854,7 @@ def main():
     elif args.input and os.path.exists(args.input):
         files_to_process = [args.input]
     else:
-        chosen = select_input_file()
-        files_to_process = [chosen]
+        files_to_process = select_input_files()
 
     print(f"\n[+] Files to process: {len(files_to_process)}")
     for f in files_to_process:
@@ -726,13 +895,20 @@ def main():
                     chosen_model = matched[0]
                     print(f"[*] Defaulting to installed model: '{chosen_model}'")
 
-    # 4. Run batch tagging
+    # 4. Check tone detection
+    detect_tone = args.detect_tone
+    if not detect_tone and not args.format:
+        t_choice = input("\nDetect dialogue tone & emotions (whisper, shout, angry, sad, etc.)? [y/n] (default 'y'): ").strip().lower()
+        detect_tone = (t_choice != "n")
+
+    # 5. Run batch tagging
     tagged_files = batch_tag_files(
         file_paths=files_to_process,
         dialogue_format=dialogue_format,
         model=chosen_model,
         url=ollama_url,
-        output_dir=DEFAULT_OUTPUT_DIR
+        output_dir=DEFAULT_OUTPUT_DIR,
+        detect_tone=detect_tone
     )
 
     # 5. Offer to update chapters.txt with the tagged files

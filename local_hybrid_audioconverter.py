@@ -10,6 +10,9 @@ import threading
 import numpy as np
 import soundfile as sf
 import torch
+if hasattr(torch, 'set_num_threads'):
+    try: torch.set_num_threads(min(4, os.cpu_count() or 4))
+    except Exception: pass
 import torchaudio
 
 # Ensure UTF-8 output on Windows console
@@ -229,17 +232,126 @@ def format_time(seconds):
 
 # ==================== PARSING & HYBRID CHUNKING ====================
 
-def split_text_into_tagged_blocks(text, default_character="narrator", characters_map=None, tag_mappings=None):
+def resolve_character_emotion_config(char_cfg, emotion="", enable_emotions=True):
     """
-    Splits text into chunks assigned to specific characters.
+    Resolves voice parameters applying reference-audio emotion overrides.
+    If an emotion (e.g. 'shout', 'whisper') is configured in char_cfg['emotions']
+    with its own reference audio clip, switches to that clip for authentic vocal delivery.
+    If the emotion is not defined in characters.json, or enable_emotions is False,
+    cleanly falls back to the character's baseline profile at native 1.0x speed and pitch
+    with zero synthetic distortion.
+    """
+    resolved = dict(char_cfg)
+    # Always keep speed and pitch at character baseline (no synthetic distortion)
+    resolved["speed"] = float(char_cfg.get("speed", 1.0))
+    resolved["pitch"] = float(char_cfg.get("pitch", 1.0))
+
+    if not enable_emotions or not emotion:
+        return resolved
+
+    emotion = emotion.lower()
+    EMOTION_ALIASES = {
+        "shouting": "shout",
+        "whispering": "whisper",
+        "screaming": "shout",
+        "yelling": "shout",
+        "crying": "sad",
+        "laughing": "happy",
+    }
+    lookup_keys = [emotion, EMOTION_ALIASES.get(emotion, emotion)]
+
+    custom_emotions = char_cfg.get("emotions", {})
+    matched_entry = None
+    for k in lookup_keys:
+        if k in custom_emotions:
+            matched_entry = custom_emotions[k]
+            break
+
+    if matched_entry:
+        if isinstance(matched_entry, dict):
+            for k, v in matched_entry.items():
+                resolved[k] = v
+            resolved["active_emotion"] = emotion
+            return resolved
+        elif isinstance(matched_entry, str):
+            resolved["ref_audio"] = matched_entry
+            resolved["active_emotion"] = emotion
+            return resolved
+
+    # Fallback: clean baseline voice, zero distortion
+    return resolved
+
+
+def write_production_voice_roster(master_output_dir, book_title_base, characters_map):
+    """Writes a standalone master voice roster text file documenting all active voices."""
+    roster_path = os.path.join(master_output_dir, f"{book_title_base}_voice_roster.txt")
+    with open(roster_path, "w", encoding="utf-8") as f:
+        f.write("======================================================================\n")
+        f.write(f" PRODUCTION VOICE ROSTER: {book_title_base.replace('_', ' ')}\n")
+        f.write("======================================================================\n\n")
+
+        # 1. GPU F5-TTS Voices
+        f5_chars = [c for c in characters_map.values() if c.get("engine", "").lower() in ["f5tts", "f5-tts"]]
+        f.write(f"GPU ENGINE: F5-TTS (Flow-Matching Voice Cloning) [{len(f5_chars)} voice(s)]\n")
+        f.write("-" * 70 + "\n")
+        if f5_chars:
+            for c in f5_chars:
+                disp = c.get("display_name", "Unknown")
+                ref = c.get("ref_audio", "N/A")
+                steps = c.get("steps", 16)
+                speed = c.get("speed", 1.0)
+                pitch = c.get("pitch", 1.0)
+                desc = c.get("description", "")
+                f.write(f"  • [{disp}]\n")
+                f.write(f"      Ref Audio : {ref}\n")
+                f.write(f"      Settings  : steps={steps}, speed={speed}, pitch={pitch}\n")
+                if desc:
+                    f.write(f"      Notes     : {desc}\n")
+                emotions = c.get("emotions", {})
+                if emotions:
+                    f.write("      Emotion Ref Clips:\n")
+                    for emo_k, emo_v in emotions.items():
+                        r_clip = emo_v.get("ref_audio") if isinstance(emo_v, dict) else emo_v
+                        f.write(f"        - [{emo_k}]: {r_clip}\n")
+                f.write("\n")
+        else:
+            f.write("  (No F5-TTS characters configured)\n\n")
+
+        # 2. CPU Kokoro Voices
+        kokoro_chars = [c for c in characters_map.values() if c.get("engine", "").lower() not in ["f5tts", "f5-tts"]]
+        f.write(f"CPU ENGINE: Kokoro TTS (Neural Speech Synthesis) [{len(kokoro_chars)} voice(s)]\n")
+        f.write("-" * 70 + "\n")
+        for c in kokoro_chars:
+            disp = c.get("display_name", "Unknown")
+            voice = c.get("voice", "af_bella")
+            speed = c.get("speed", 1.0)
+            pitch = c.get("pitch", 1.0)
+            desc = c.get("description", "")
+            f.write(f"  • [{disp}]\n")
+            f.write(f"      Voice     : {voice}\n")
+            f.write(f"      Settings  : speed={speed}, pitch={pitch}\n")
+            if desc:
+                f.write(f"      Notes     : {desc}\n")
+            emotions = c.get("emotions", {})
+            if emotions:
+                f.write(f"      Emotions  : {', '.join(emotions.keys())}\n")
+            f.write("\n")
+
+        f.write("======================================================================\n")
+    return roster_path
+
+
+def split_text_into_tagged_blocks(text, default_character="narrator", characters_map=None, tag_mappings=None, enable_emotions=True):
+    """
+    Splits text into chunks assigned to specific characters and optional emotion/tone.
     Recognizes:
       1. Section dividers: ***, ---, * * *
       2. Block tags:
-           [villain]
+           [villain] or [villain:angry]
            Dialogue or paragraphs here
            [/villain]
-      3. Paragraph prefix tags:
-           [villain] "I will destroy everything," he laughed.
+      3. Inline tags:
+           Narration [Hero:whisper] "Stay back," [/Hero] narration.
       4. Default text without tags -> assigned to default_character (narrator).
     """
     paragraphs = text.split("\n")
@@ -254,6 +366,7 @@ def split_text_into_tagged_blocks(text, default_character="narrator", characters
         return t_clean
 
     current_char = resolve_char(default_character)
+    current_emotion = ""
     in_explicit_block = False
 
     i = 0
@@ -269,26 +382,31 @@ def split_text_into_tagged_blocks(text, default_character="narrator", characters
             blocks.append({
                 "type": "DIVIDER",
                 "character": "DIVIDER",
+                "emotion": "",
                 "text": "DIVIDER"
             })
             continue
 
-        # 2. Check for closing block tag: [/character]
-        close_match = re.match(r"^\[\s*/\s*([a-zA-Z0-9_\-]+)\s*\]$", raw_line)
+        # 2. Check for closing block tag: [/character] or [/character:emotion]
+        close_match = re.match(r"^\[\s*/\s*([a-zA-Z0-9_\-]+)(?::[a-zA-Z0-9_\-]+)?\s*\]$", raw_line)
         if close_match:
             in_explicit_block = False
             current_char = resolve_char(default_character)
+            current_emotion = ""
             continue
 
-        # 3. Check for opening block tag: [character] alone on a line
-        open_block_match = re.match(r"^\[\s*([a-zA-Z0-9_\-]+)\s*\]$", raw_line)
+        # 3. Check for opening block tag: [character] or [character:emotion] alone on a line
+        open_block_match = re.match(r"^\[\s*([a-zA-Z0-9_\-]+)(?::([a-zA-Z0-9_\-]+))?\s*\]$", raw_line)
         if open_block_match:
             in_explicit_block = True
             current_char = resolve_char(open_block_match.group(1))
+            current_emotion = (open_block_match.group(2).lower() if open_block_match.group(2) else "") if enable_emotions else ""
             continue
 
-        # 4. Check for embedded inline tags: e.g. Narration [Hero] "Dialogue" [/Hero] Narration
-        inline_tag_pattern = re.compile(r"\[\s*([a-zA-Z0-9_\-]+)\s*\](.*?)\[\s*/\s*\1\s*\]")
+        # 4. Check for embedded inline tags: e.g. Narration [Hero:whisper] "Dialogue" [/Hero] Narration
+        inline_tag_pattern = re.compile(
+            r"\[\s*([a-zA-Z0-9_\-]+)(?::([a-zA-Z0-9_\-]+))?\s*\](.*?)\[\s*/\s*\1(?::[a-zA-Z0-9_\-]+)?\s*\]"
+        )
         if not in_explicit_block and inline_tag_pattern.search(raw_line):
             pos = 0
             for match in inline_tag_pattern.finditer(raw_line):
@@ -298,14 +416,17 @@ def split_text_into_tagged_blocks(text, default_character="narrator", characters
                     blocks.append({
                         "type": "VOICE",
                         "character": current_char,
+                        "emotion": current_emotion,
                         "text": before
                     })
                 char_name = resolve_char(match.group(1))
-                dialogue = match.group(2).strip()
+                emotion = (match.group(2).lower() if match.group(2) else "") if enable_emotions else ""
+                dialogue = match.group(3).strip()
                 if dialogue:
                     blocks.append({
                         "type": "VOICE",
                         "character": char_name,
+                        "emotion": emotion,
                         "text": dialogue
                     })
                 pos = end
@@ -314,19 +435,22 @@ def split_text_into_tagged_blocks(text, default_character="narrator", characters
                 blocks.append({
                     "type": "VOICE",
                     "character": current_char,
+                    "emotion": current_emotion,
                     "text": after
                 })
             continue
 
-        # 5. Check for single prefix tag without closing: [character] Rest of text...
-        prefix_match = re.match(r"^\[\s*([a-zA-Z0-9_\-]+)\s*\]\s*(.*)$", raw_line)
+        # 5. Check for single prefix tag without closing: [character:emotion] Rest of text...
+        prefix_match = re.match(r"^\[\s*([a-zA-Z0-9_\-]+)(?::([a-zA-Z0-9_\-]+))?\s*\]\s*(.*)$", raw_line)
         if prefix_match and not in_explicit_block:
             char_name = resolve_char(prefix_match.group(1))
-            content = prefix_match.group(2).strip()
+            emotion = (prefix_match.group(2).lower() if prefix_match.group(2) else "") if enable_emotions else ""
+            content = prefix_match.group(3).strip()
             if content:
                 blocks.append({
                     "type": "VOICE",
                     "character": char_name,
+                    "emotion": emotion,
                     "text": content
                 })
             continue
@@ -335,10 +459,11 @@ def split_text_into_tagged_blocks(text, default_character="narrator", characters
         blocks.append({
             "type": "VOICE",
             "character": current_char,
+            "emotion": current_emotion if in_explicit_block else "",
             "text": raw_line
         })
 
-    # Group contiguous blocks of the same character up to maximum character limits
+    # Group contiguous blocks of the same character and emotion up to maximum character limits
     merged_chunks = []
     for b in blocks:
         if b["type"] == "DIVIDER":
@@ -346,9 +471,12 @@ def split_text_into_tagged_blocks(text, default_character="narrator", characters
             continue
 
         char = b["character"]
+        emotion = b.get("emotion", "")
         text_piece = b["text"]
 
-        if merged_chunks and merged_chunks[-1]["type"] == "VOICE" and merged_chunks[-1]["character"] == char:
+        if (merged_chunks and merged_chunks[-1]["type"] == "VOICE"
+                and merged_chunks[-1]["character"] == char
+                and (not enable_emotions or merged_chunks[-1].get("emotion", "") == emotion)):
             prev_len = len(merged_chunks[-1]["text"])
             char_cfg = (characters_map or {}).get(char.lower(), {})
             is_f5 = char_cfg.get("engine", "").lower() in ["f5tts", "f5-tts"] or "f5" in char.lower()
@@ -360,6 +488,7 @@ def split_text_into_tagged_blocks(text, default_character="narrator", characters
         merged_chunks.append({
             "type": "VOICE",
             "character": char,
+            "emotion": emotion,
             "text": text_piece
         })
 
@@ -503,10 +632,18 @@ def render_f5tts_chunk_local(text, char_cfg, output_wav, temp_dir, chunk_index):
     ref_audio = char_cfg.get("ref_audio", "ref_sample.wav")
     ref_text = char_cfg.get("ref_text", "")
     speed = float(char_cfg.get("speed", 1.0))
-    steps = int(char_cfg.get("steps", 32))
+    steps = int(char_cfg.get("steps", 16))
 
     if not os.path.exists(ref_audio):
         raise FileNotFoundError(f"F5-TTS reference audio '{ref_audio}' does not exist.")
+
+    # Guard check: Warn if reference audio is > 11.5s to prevent F5-TTS internal clipping & text bleed
+    try:
+        ref_dur = get_wav_duration(ref_audio)
+        if ref_dur > 11.5:
+            safe_print(f"  [!] Note: Reference audio '{ref_audio}' is {ref_dur:.1f}s (> 11.5s). F5-TTS clips audio at 12s which causes trailing reference text to bleed into output. Optimal duration is 5-10s.")
+    except Exception:
+        pass
 
     sentences = split_sentences(text, max_len=MAX_CHARS_PER_F5_CHUNK)
 
@@ -517,14 +654,15 @@ def render_f5tts_chunk_local(text, char_cfg, output_wav, temp_dir, chunk_index):
             gen_text=sentences[0],
             file_wave=output_wav,
             speed=speed,
-            nfe_step=steps
+            nfe_step=steps,
+            show_info=lambda *args, **kwargs: None,
+            progress=None
         )
         if not os.path.exists(output_wav):
             sf.write(output_wav, wav, sr)
     else:
         audio_segments = []
         target_sr = 24000
-        # 0.18s natural pause between sentences
         pause_samples = int(0.18 * target_sr)
         pause = np.zeros(pause_samples, dtype=np.float32)
 
@@ -537,7 +675,9 @@ def render_f5tts_chunk_local(text, char_cfg, output_wav, temp_dir, chunk_index):
                 ref_text=ref_text,
                 gen_text=sentence,
                 speed=speed,
-                nfe_step=steps
+                nfe_step=steps,
+                show_info=lambda *args, **kwargs: None,
+                progress=None
             )
             target_sr = sr
             if audio_segments:
@@ -550,9 +690,11 @@ def render_f5tts_chunk_local(text, char_cfg, output_wav, temp_dir, chunk_index):
 
 # ==================== PARALLEL CHAPTER PROCESSING ====================
 
-def process_hybrid_chapter_simultaneous(txt_filename, characters_map, master_output_dir, tag_mappings=None):
+def process_hybrid_chapter_simultaneous(txt_filename, characters_map, master_output_dir, tag_mappings=None, enable_emotions=True):
     """
-    Processes a chapter by running F5-TTS on GPU and Kokoro on CPU simultaneously.
+    Processes a chapter by running F5-TTS on GPU and Kokoro on CPU simultaneously,
+    featuring an interactive chunk progress bar, emotion/tone modulation, and
+    case-insensitive master voice roster logging.
     """
     if not os.path.exists(txt_filename):
         safe_print(f"  [!] Warning: Could not find chapter file '{txt_filename}'. Skipping.")
@@ -572,7 +714,7 @@ def process_hybrid_chapter_simultaneous(txt_filename, characters_map, master_out
     with open(txt_filename, "r", encoding="utf-8") as f:
         raw_text = f.read()
 
-    chunks = split_text_into_tagged_blocks(raw_text, default_character="narrator", characters_map=characters_map, tag_mappings=tag_mappings)
+    chunks = split_text_into_tagged_blocks(raw_text, default_character="narrator", characters_map=characters_map, tag_mappings=tag_mappings, enable_emotions=enable_emotions)
     safe_print(f"\n--> Processing Simultaneous Hybrid Chapter: '{txt_filename}' ({len(chunks)} blocks)")
 
     # Prepare shared data structures
@@ -584,16 +726,53 @@ def process_hybrid_chapter_simultaneous(txt_filename, characters_map, master_out
     chapter_silence_file = None
     all_tasks = []
 
+    # Initialize tqdm progress bar
+    try:
+        from tqdm import tqdm
+    except ImportError:
+        tqdm = None
+
+    progress_bar = None
+    if tqdm is not None:
+        short_title = base_name[:22]
+        progress_bar = tqdm(
+            total=len(chunks),
+            desc=f"Chapter Chunks [{short_title}]",
+            unit="chunk",
+            dynamic_ncols=True,
+            leave=True
+        )
+
+    progress_lock = threading.Lock()
+
+    def record_chunk_done(meta, desc_info=""):
+        with progress_lock:
+            completed_chunks[meta["index"]] = meta
+            if progress_bar:
+                if desc_info:
+                    progress_bar.set_postfix_str(desc_info, refresh=False)
+                progress_bar.update(1)
+
+    def log_print(msg):
+        if progress_bar:
+            tqdm.write(msg)
+        else:
+            safe_print(msg)
+
     # 1. Pre-scan all chunks and route
     for i, chunk in enumerate(chunks):
         chunk_idx = i + 1
         chunk_filename = os.path.join(chapter_output_dir, f"chunk_{chunk_idx:03d}.wav")
         c_type = chunk["type"]
         char_name = chunk["character"]
+        emotion = chunk.get("emotion", "") if enable_emotions else ""
         canonical_char = tag_mappings.get(char_name.lower(), char_name.lower()) if tag_mappings else char_name.lower()
-        char_cfg = characters_map.get(canonical_char, characters_map.get("narrator", {}))
+        base_char_cfg = characters_map.get(canonical_char, characters_map.get("narrator", {}))
+        char_cfg = resolve_character_emotion_config(base_char_cfg, emotion, enable_emotions=enable_emotions)
+
         engine = char_cfg.get("engine", "kokoro").lower()
         pitch_factor = float(char_cfg.get("pitch", 1.0))
+        speed_factor = float(char_cfg.get("speed", 1.0))
         display_name = char_cfg.get("display_name", canonical_char.title())
 
         if c_type == "DIVIDER":
@@ -601,12 +780,23 @@ def process_hybrid_chapter_simultaneous(txt_filename, characters_map, master_out
             engine_label = "SILENCE"
         elif engine in ["f5tts", "f5-tts"]:
             ref_audio_name = os.path.basename(char_cfg.get("ref_audio", "sample.wav"))
-            voice_label = f"f5tts [ref: {ref_audio_name}]"
+            act_emo = char_cfg.get("active_emotion", "")
+            if act_emo:
+                voice_label = f"f5tts [{act_emo}: {ref_audio_name}]"
+            else:
+                voice_label = f"f5tts [ref: {ref_audio_name}]"
             engine_label = "F5-TTS (GPU)"
         else:
             kokoro_voice = char_cfg.get("voice", "af_bella")
+            extras = []
+            if emotion:
+                extras.append(f"tone: {emotion}")
             if pitch_factor != 1.0:
-                voice_label = f"{kokoro_voice} (pitch: {pitch_factor})"
+                extras.append(f"pitch: {pitch_factor}")
+            if speed_factor != 1.0:
+                extras.append(f"speed: {speed_factor}")
+            if extras:
+                voice_label = f"{kokoro_voice} ({', '.join(extras)})"
             else:
                 voice_label = kokoro_voice
             engine_label = "KOKORO (CPU)"
@@ -616,6 +806,7 @@ def process_hybrid_chapter_simultaneous(txt_filename, characters_map, master_out
             "total": len(chunks),
             "type": c_type,
             "character": display_name,
+            "emotion": emotion,
             "char_cfg": char_cfg,
             "engine": engine,
             "engine_label": engine_label,
@@ -628,20 +819,21 @@ def process_hybrid_chapter_simultaneous(txt_filename, characters_map, master_out
 
         # Resume support: skip if already rendered
         if os.path.exists(chunk_filename) and os.path.getsize(chunk_filename) > 0:
-            safe_print(f"    [Chunk {chunk_idx:03d}/{len(chunks)}] Found existing on disk. Resuming...")
-            completed_chunks[chunk_idx] = {
+            log_print(f"    [Chunk {chunk_idx:03d}/{len(chunks)}] Found existing on disk. Resuming...")
+            meta = {
                 "index": chunk_idx,
                 "filename": f"chunk_{chunk_idx:03d}.wav",
-                "character": char_name,
+                "character": display_name,
                 "engine": engine_label,
                 "voice": voice_label,
                 "duration": get_wav_duration(chunk_filename)
             }
+            record_chunk_done(meta, desc_info=f"Resume: {display_name}")
             continue
 
         # Immediate handling for Section Dividers
         if c_type == "DIVIDER":
-            safe_print(f"    [Chunk {chunk_idx:03d}/{len(chunks)}] Section Divider (2s Pause)")
+            log_print(f"    [Chunk {chunk_idx:03d}/{len(chunks)}] Section Divider (2s Pause)")
             if not chapter_silence_file:
                 chapter_silence_file = generate_silence_file(master_output_dir)
 
@@ -650,7 +842,7 @@ def process_hybrid_chapter_simultaneous(txt_filename, characters_map, master_out
             with open(chunk_filename, "wb") as out_f:
                 out_f.write(silence_data)
 
-            completed_chunks[chunk_idx] = {
+            meta = {
                 "index": chunk_idx,
                 "filename": f"chunk_{chunk_idx:03d}.wav",
                 "character": "DIVIDER",
@@ -658,6 +850,7 @@ def process_hybrid_chapter_simultaneous(txt_filename, characters_map, master_out
                 "voice": voice_label,
                 "duration": get_wav_duration(chunk_filename)
             }
+            record_chunk_done(meta, desc_info="Divider")
             continue
 
         # Route to respective engine queue
@@ -684,7 +877,7 @@ def process_hybrid_chapter_simultaneous(txt_filename, characters_map, master_out
             v_label = task["voice_label"]
             e_label = task["engine_label"]
 
-            safe_print(f"    [Chunk {idx:03d}/{total}] [CPU-Kokoro] [{char.upper()}] (Voice: {v_label}) ({len(text)} chars)...")
+            log_print(f"    [Chunk {idx:03d}/{total}] [CPU-Kokoro] [{char.upper()}] (Voice: {v_label}) ({len(text)} chars)...")
             temp_raw = os.path.join(chapter_output_dir, f"temp_raw_{idx:03d}.wav")
 
             t0 = time.time()
@@ -699,9 +892,9 @@ def process_hybrid_chapter_simultaneous(txt_filename, characters_map, master_out
 
                 dur = get_wav_duration(chunk_file)
                 elapsed = time.time() - t0
-                safe_print(f"    [OK] [Chunk {idx:03d}/{total}] [CPU-Kokoro] Done in {elapsed:.2f}s (Audio: {dur:.2f}s)")
+                log_print(f"    [OK] [Chunk {idx:03d}/{total}] [CPU-Kokoro] Done in {elapsed:.2f}s (Audio: {dur:.2f}s)")
 
-                completed_chunks[idx] = {
+                meta = {
                     "index": idx,
                     "filename": f"chunk_{idx:03d}.wav",
                     "character": char,
@@ -709,8 +902,9 @@ def process_hybrid_chapter_simultaneous(txt_filename, characters_map, master_out
                     "voice": v_label,
                     "duration": dur
                 }
+                record_chunk_done(meta, desc_info=f"Kokoro: {char}")
             except Exception as e:
-                safe_print(f"    [X] Error rendering Kokoro chunk {idx} ({char}): {e}")
+                log_print(f"    [X] Error rendering Kokoro chunk {idx} ({char}): {e}")
                 worker_errors.append((idx, char, e))
                 if os.path.exists(temp_raw):
                     try: os.remove(temp_raw)
@@ -735,7 +929,7 @@ def process_hybrid_chapter_simultaneous(txt_filename, characters_map, master_out
             v_label = task["voice_label"]
             e_label = task["engine_label"]
 
-            safe_print(f"    [Chunk {idx:03d}/{total}] [GPU-F5TTS]  [{char.upper()}] (Voice: {v_label}) ({len(text)} chars)...")
+            log_print(f"    [Chunk {idx:03d}/{total}] [GPU-F5TTS]  [{char.upper()}] (Voice: {v_label}) ({len(text)} chars)...")
             temp_raw = os.path.join(chapter_output_dir, f"temp_raw_{idx:03d}.wav")
 
             t0 = time.time()
@@ -750,9 +944,9 @@ def process_hybrid_chapter_simultaneous(txt_filename, characters_map, master_out
 
                 dur = get_wav_duration(chunk_file)
                 elapsed = time.time() - t0
-                safe_print(f"    [OK] [Chunk {idx:03d}/{total}] [GPU-F5TTS]  Done in {elapsed:.2f}s (Audio: {dur:.2f}s)")
+                log_print(f"    [OK] [Chunk {idx:03d}/{total}] [GPU-F5TTS]  Done in {elapsed:.2f}s (Audio: {dur:.2f}s)")
 
-                completed_chunks[idx] = {
+                meta = {
                     "index": idx,
                     "filename": f"chunk_{idx:03d}.wav",
                     "character": char,
@@ -760,8 +954,9 @@ def process_hybrid_chapter_simultaneous(txt_filename, characters_map, master_out
                     "voice": v_label,
                     "duration": dur
                 }
+                record_chunk_done(meta, desc_info=f"F5: {char}")
             except Exception as e:
-                safe_print(f"    [X] Error rendering F5-TTS chunk {idx} ({char}): {e}")
+                log_print(f"    [X] Error rendering F5-TTS chunk {idx} ({char}): {e}")
                 worker_errors.append((idx, char, e))
                 if os.path.exists(temp_raw):
                     try: os.remove(temp_raw)
@@ -773,7 +968,7 @@ def process_hybrid_chapter_simultaneous(txt_filename, characters_map, master_out
     pending_kokoro = kokoro_queue.qsize()
     pending_f5 = f5_queue.qsize()
 
-    safe_print(f"[*] Queued tasks: {pending_kokoro} Kokoro chunks (CPU), {pending_f5} F5-TTS chunks (GPU).")
+    log_print(f"[*] Queued tasks: {pending_kokoro} Kokoro chunks (CPU), {pending_f5} F5-TTS chunks (GPU).")
 
     threads = []
     # GPU F5-TTS Worker (1 thread targeting NVIDIA GPU)
@@ -793,6 +988,10 @@ def process_hybrid_chapter_simultaneous(txt_filename, characters_map, master_out
     # Wait for all workers to complete
     for t in threads:
         t.join()
+
+    # Close progress bar cleanly
+    if progress_bar:
+        progress_bar.close()
 
     # Check for any failures
     if worker_errors:
@@ -846,25 +1045,34 @@ def process_hybrid_chapter_simultaneous(txt_filename, characters_map, master_out
             tf.write(f" ABSOLUTE TIMESTAMP LOG: {base_name}\n")
             tf.write(f" Output File: {os.path.basename(final_mp3)}\n")
             tf.write("======================================================================\n")
-            used_characters = {
-                meta["character"]
+            used_chars_lower = {
+                str(meta["character"]).strip().lower()
                 for meta in chunk_metadata
                 if meta["character"] != "DIVIDER"
             }
             tf.write("VOICE ROSTER USED:\n")
             for c_name, c_info in characters_map.items():
-                if c_name not in used_characters:
+                if c_name.strip().lower() not in used_chars_lower:
                     continue
+                disp = c_info.get("display_name", c_name.title())
                 c_eng = c_info.get("engine", "kokoro").upper()
-                if c_eng == "KOKORO":
+                if c_eng in ["F5TTS", "F5-TTS"]:
+                    ref_f = os.path.basename(c_info.get("ref_audio", "sample.wav"))
+                    emotions = c_info.get("emotions", {})
+                    emo_str = f" (emotions: {', '.join(emotions.keys())})" if emotions else ""
+                    tf.write(f"  • [{disp}] (F5-TTS - GPU): ref={ref_f}{emo_str}\n")
+                else:
                     v_str = c_info.get("voice", "af_bella")
                     p_val = float(c_info.get("pitch", 1.0))
-                    if p_val != 1.0:
-                        v_str += f" (pitch: {p_val})"
-                    tf.write(f"  - [{c_name}] (KOKORO - CPU): {v_str}\n")
-                else:
-                    ref_f = os.path.basename(c_info.get("ref_audio", "sample.wav"))
-                    tf.write(f"  - [{c_name}] (F5-TTS - GPU): {ref_f}\n")
+                    s_val = float(c_info.get("speed", 1.0))
+                    extras = []
+                    if p_val != 1.0: extras.append(f"pitch: {p_val}")
+                    if s_val != 1.0: extras.append(f"speed: {s_val}")
+                    emotions = c_info.get("emotions", {})
+                    if emotions: extras.append(f"emotions: {', '.join(emotions.keys())}")
+                    if extras:
+                        v_str += f" ({', '.join(extras)})"
+                    tf.write(f"  • [{disp}] (KOKORO - CPU): {v_str}\n")
             tf.write("======================================================================\n\n")
 
             for meta in chunk_metadata:
@@ -947,6 +1155,22 @@ def main():
     safe_print("  Simultaneous Hybrid Audiobook Generator (CPU Kokoro + GPU F5)  ")
     safe_print("==================================================================")
 
+    import argparse
+    parser = argparse.ArgumentParser(description="Simultaneous Hybrid Audiobook Generator (CPU Kokoro + GPU F5)")
+    parser.add_argument("--emotions", dest="enable_emotions", action="store_true", default=None, help="Enable dialogue tone/emotion effects (speed & pitch modulation).")
+    parser.add_argument("--no-emotions", dest="enable_emotions", action="store_false", help="Disable dialogue tone/emotion effects (pure clean baseline voices).")
+    args, _ = parser.parse_known_args()
+
+    enable_emotions = args.enable_emotions
+    if enable_emotions is None:
+        safe_print("\nDialogue Tone & Emotion Delivery:")
+        safe_print("  [1] Enabled  - Apply tone modulation (whisper, shout, angry, etc.) [Default]")
+        safe_print("  [2] Disabled - Pure baseline voices only (zero speed/pitch distortion)")
+        emo_choice = input("Select option [1 or 2] (default 1): ").strip()
+        enable_emotions = (emo_choice != "2")
+
+    safe_print(f"[*] Tone & Emotion Mode: {'ENABLED (Acoustic Modulation)' if enable_emotions else 'DISABLED (Pure Baseline)'}")
+
     if not os.path.exists(MANIFEST_FILE):
         safe_print(f"Error: Could not find manifest file '{MANIFEST_FILE}'.")
         safe_print(f"Tip: Run 'new_text_parser.py' first to format chapters into '{MANIFEST_FILE}'.")
@@ -990,6 +1214,9 @@ def main():
         shutil.move(finished_candidate, master_output_dir)
 
     os.makedirs(master_output_dir, exist_ok=True)
+
+    # Generate master production voice roster documenting all active characters
+    write_production_voice_roster(master_output_dir, book_title_base, characters)
 
     # ==================== UPFRONT RE-RECORD SCANNER ====================
     scan_results = []
@@ -1060,7 +1287,7 @@ def main():
     # ==================== MAIN PROCESSING LOOP ====================
     for idx, txt_file in enumerate(chapter_files, 1):
         safe_print(f"\n[{idx}/{len(chapter_files)}] Processing chapter: {txt_file}")
-        success = process_hybrid_chapter_simultaneous(txt_file, characters, master_output_dir, tag_mappings=tag_mappings)
+        success = process_hybrid_chapter_simultaneous(txt_file, characters, master_output_dir, tag_mappings=tag_mappings, enable_emotions=enable_emotions)
         if not success:
             safe_print(f"[!] Pausing due to error in {txt_file}.")
             break

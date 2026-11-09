@@ -207,12 +207,12 @@ def cut_summary_and_next_text_line(text):
 
 def cut_trailing_sections_interactive(body_text, chapter_label="", session_state=None):
     """
-    Interactively reviews trailing sections separated by '***' from the end of a chapter.
-    Shows an excerpt before confirming the cut.
+    Interactively reviews trailing sections separated by '***' or End Notes headers
+    from the end of a chapter. Shows an excerpt before confirming the cut.
     Supports:
       [y] Cut section
       [n] Keep section (default)
-      [a] Cut this & automatically cut 1 trailing section from all remaining chapters
+      [a] Cut this & automatically cut trailing section from all remaining chapters
       [s] Skip / keep all remaining chapters
     """
     if session_state is None:
@@ -222,6 +222,30 @@ def cut_trailing_sections_interactive(body_text, chapter_label="", session_state
         return cut_trailing_sections_bulk(body_text, 1)
     if session_state.get("auto_keep_all"):
         return body_text
+
+    # First check if an End Notes or Afterword header exists in the text
+    end_notes_match = re.search(r"(?im)^\s*(?:Afterword|Chapter\s+End\s+Notes|End\s+Notes)\b", body_text)
+    if end_notes_match:
+        end_notes_excerpt = body_text[end_notes_match.start():min(len(body_text), end_notes_match.start() + 250)].replace("\n", " ").strip()
+        print("\n" + "=" * 70)
+        print(f"[{chapter_label}] End Notes / Afterword Detected")
+        print(f'"{end_notes_excerpt}..."')
+        print("-" * 70)
+        print("Options: [y] Cut End Notes | [n] Keep End Notes (default) | [a] Cut in all chapters | [s] Keep in all chapters")
+        raw_choice = input("Cut this End Notes section? [y/n/a/s] (default 'n'): ").strip().lower()
+        choice = raw_choice if raw_choice else "n"
+        if choice in ("a", "all"):
+            session_state["auto_cut_all"] = True
+            body_text = body_text[:end_notes_match.start()].strip()
+            print("  [+] Cut End Notes. Will cut trailing notes from all remaining chapters.")
+        elif choice in ("s", "skip"):
+            session_state["auto_keep_all"] = True
+            print("  [-] Kept End Notes. Will keep all remaining chapters.")
+        elif choice in ("y", "yes"):
+            body_text = body_text[:end_notes_match.start()].strip()
+            print("  [+] Cut End Notes section.")
+        else:
+            print("  [-] Kept End Notes section.")
 
     body_text = normalize_dividers(body_text)
     cleaned_body = re.sub(r"(?:\n\s*\*\*\*\s*)+$", "", body_text).strip()
@@ -266,9 +290,10 @@ def cut_trailing_sections_interactive(body_text, chapter_label="", session_state
 
 
 def cut_trailing_sections_bulk(body_text, cut_count):
-    """Cuts N trailing sections from the end of a body separated by '***'."""
+    """Cuts N trailing sections or end notes from the end of a body."""
     if cut_count <= 0:
         return body_text
+    body_text = cut_end_notes(body_text)
     body_text = normalize_dividers(body_text)
     cleaned_body = re.sub(r"(?:\n\s*\*\*\*\s*)+$", "", body_text).strip()
     parts = [p.strip() for p in re.split(r"\n\s*\*\*\*\s*\n", cleaned_body) if p.strip()]
@@ -440,7 +465,8 @@ def parse_book_file(
             "title": chap_title,
         })
 
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    book_output_dir = os.path.join(OUTPUT_DIR, safe_work_title)
+    os.makedirs(book_output_dir, exist_ok=True)
     created_files = []
 
     # =========================================================================
@@ -458,7 +484,7 @@ def parse_book_file(
         intro_content = apply_word_replacements(intro_content, replacements)
         intro_content = normalize_dividers(intro_content)
 
-        intro_filename = os.path.join(OUTPUT_DIR, f"00_intro_{safe_work_title}.txt")
+        intro_filename = os.path.join(book_output_dir, f"00_intro_{safe_work_title}.txt")
         with open(intro_filename, "w", encoding="utf-8") as out_f:
             out_f.write(intro_content)
         created_files.append(intro_filename)
@@ -495,8 +521,7 @@ def parse_book_file(
             # Cut 1: If note pointer found, cut from chapter title up to and including lines above
             body_text = cut_note_pointer_and_lines_above(body_text)
 
-            # Cut 2: If 'Chapter End Notes' or 'End Notes' found, cut that line and everything following
-            body_text = cut_end_notes(body_text)
+            # End Notes cutting is now handled via interactive review or bulk mode
 
             # Cut 3: If 'Chapter Summary' or 'Summary' on a line, cut it and next text line
             body_text = cut_summary_and_next_text_line(body_text)
@@ -539,7 +564,7 @@ def parse_book_file(
             else:
                 chapter_file_base = f"{track_prefix}_Chapter_{chap_num_str}.txt"
 
-            chapter_path = os.path.join(OUTPUT_DIR, chapter_file_base)
+            chapter_path = os.path.join(book_output_dir, chapter_file_base)
             with open(chapter_path, "w", encoding="utf-8") as out_f:
                 out_f.write(formatted_chapter)
 
@@ -565,8 +590,7 @@ def parse_book_file(
         # Cut 2: If 'Chapter Summary' or 'Summary' on a line, cut it and next text line
         after_author = cut_summary_and_next_text_line(after_author)
 
-        # Cut 3: If 'Afterword', 'Chapter End Notes', or 'End Notes' found, cut it and everything following
-        after_author = cut_end_notes(after_author)
+        # End Notes cutting is now handled via interactive review or bulk mode
 
         # Strip any dangling trailing divider
         after_author = re.sub(r"(?:\n\s*(?:(?:\*\s*){3,}|(?:-\s*){3,}|(?:_\s*){3,}|(?:[—–]\s*){3,})\s*)+$", "", after_author).strip()
@@ -600,7 +624,7 @@ def parse_book_file(
         final_content = normalize_dividers(final_content)
 
         # Clean, safe, short output filename
-        output_filename = os.path.join(OUTPUT_DIR, clean_file_base)
+        output_filename = os.path.join(book_output_dir, clean_file_base)
         with open(output_filename, "w", encoding="utf-8") as out_f:
             out_f.write(final_content)
 
@@ -613,7 +637,7 @@ def parse_book_file(
             mf.write(f"{cf}\n")
 
     print("\n" + "=" * 60)
-    print(f"[+] Successfully parsed {len(created_files)} files into '{OUTPUT_DIR}'!")
+    print(f"[+] Successfully parsed {len(created_files)} files into '{book_output_dir}'!")
     print(f"[+] Updated manifest file '{MANIFEST_FILE}'.")
     print("=" * 60)
     return created_files
@@ -712,11 +736,15 @@ def main():
             else:
                 chosen_format = "prose"
 
+            tone_choice = input("Detect dialogue tone & emotions (whisper, shout, angry, etc.)? [y/n] (default 'y'): ").strip().lower()
+            detect_tone = (tone_choice != "n")
+
             try:
                 import llm_dialogue_tagger
                 tagged_files = llm_dialogue_tagger.batch_tag_files(
                     file_paths=created_files,
-                    dialogue_format=chosen_format
+                    dialogue_format=chosen_format,
+                    detect_tone=detect_tone
                 )
                 if tagged_files:
                     with open(MANIFEST_FILE, "w", encoding="utf-8") as mf:
