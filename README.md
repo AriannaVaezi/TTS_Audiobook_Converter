@@ -1,28 +1,30 @@
 # Hybrid Multi-Voice Audiobook Generator
 
-An automated text-to-speech (TTS) pipeline designed for creating audiobooks with dynamic, multi-voice narration. It combines the speed and clarity of **Kokoro TTS** for general narration with the voice-cloning capabilities of **F5-TTS** for specific characters and dialogue.
+An automated text-to-speech (TTS) pipeline designed for creating audiobooks with dynamic, multi-voice narration. It combines the speed and clarity of **Kokoro TTS running 100% locally on CPU** for general narration with the voice-cloning capabilities of **F5-TTS running on GPU** for specific characters and dialogue.
 
 ---
 
 ## Key Features
 
-* **Hybrid TTS Engine**:
-  * **Kokoro TTS (API)**: Fast, natural, high-fidelity narration for general book text and secondary characters (supports 50/50 and weighted voice blending).
-  * **F5-TTS (Flow Matching)**: Zero-shot voice cloning for custom characters using a simple 5–10 second audio sample.
+* **Hybrid Simultaneous TTS Engine (`local_hybrid_audioconverter.py`)**:
+  * **Kokoro TTS (100% Local CPU)**: Fast, natural, high-fidelity neural narration for general book text and secondary characters (no Docker, no server, and no cloud API required; supports 50/50 and custom weighted voice blending).
+  * **F5-TTS (Flow-Matching on GPU)**: Zero-shot voice cloning for custom characters using a clean 5–10 second reference audio sample.
+  * **Simultaneous Parallel Rendering**: CPU Kokoro and GPU F5-TTS render concurrently on separate threads for maximum generation throughput.
+* **Unified All-In-One Pipeline (`run_pipeline.py`)**:
+  * Automates the full process in a single command: supply a web URL, ebook (`.epub`, `.pdf`, `.mobi`), or text file, and it handles ingestion, chapter parsing, dialogue tagging, and audio conversion end-to-end.
 * **Intelligent Text Parser (`new_text_parser.py`)**:
   * Automatically detects chapters (`Chapter 1`, `Chapter 1: Title`).
-  * Extracts the title and author.
+  * Extracts clean title and author metadata.
   * Strips fanfiction/AO3 metadata, author notes, chapter summaries, and end notes.
   * Optionally heals manual hard-wrapped line breaks while preserving dialogue and section dividers.
   * Interactive or bulk trailing section removal (with live text excerpts).
-* **Robust Audio Generation (`hybrid_audioconverter.py`)**:
-  * **Upfront Re-record Options**: Scans all sections at launch and lets you selectively re-record specific chapters (or the entire book) without having to babysit the process.
+* **Smart Dialogue & Emotion Tagger (`llm_dialogue_tagger.py`)**:
+  * **Fast Smart Parser (Instant & 100% Quote Coverage)**: Grammar-aware speech verb detection and conversational turn-taking tags entire books in seconds with zero GPU wait.
+  * **Dialogue Emotion Routing**: Detects conversational tones (whisper, shout, calm, sad, etc.) and routes them to character emotion reference clips with zero synthetic distortion.
+* **Robust Audio Generation & Production**:
+  * **Upfront Re-record Scanner**: Scans all sections at launch and lets you selectively re-record specific chapters (or resume automatically).
   * **Automatic Archiving**: Completed audiobook folders are automatically moved to a dedicated `finished/` directory.
-  * **Resume Support**: Completed chapters and previously rendered chunks are skipped automatically.
-  * **Smart Sentence Chunking**: Monologues rendered by F5-TTS are split on sentence boundaries under 300 characters for high flow-matching fidelity, then spliced together seamlessly.
-  * **Section Dividers**: Inserts a clean 2-second silent pause wherever `***` appears.
-  * **Rubberband Pitch Shifting**: Post-production pitch adjustment per character or globally without altering playback speed.
-  * **Timestamp Tracking**: Generates an absolute timestamp log (`_timestamps.txt`) showing start and end times for each character chunk.
+  * **Timestamp Tracking**: Generates an absolute timestamp log (`_timestamps.txt`) and master production voice roster (`_voice_roster.txt`).
   * **Automatic Packaging**: Combines all finished chapter MP3s into a ZIP archive.
 
 ---
@@ -30,16 +32,34 @@ An automated text-to-speech (TTS) pipeline designed for creating audiobooks with
 ## Project Structure
 
 ```text
-├── raw_txt/                    # Place raw story/book .txt files here
-│   └── .gitkeep
-├── new_text_parser.py          # Cleans and splits raw text into formatted chapters
-├── llm_dialogue_tagger.py      # Local GPU LLM dialogue tagger & voice mapper (Ollama/Qwen 2.5)
-├── local_hybrid_audioconverter.py # Simultaneous CPU Kokoro + GPU F5-TTS generator (No Docker required)
-├── hybrid_audioconverter.py    # Legacy Docker/API-based generator
-├── requirements.txt            # Python dependencies (with CUDA PyTorch index)
-├── setup_env.bat               # One-click virtual environment setup script (Windows)
-├── characters.json             # Character-to-voice mapping configuration (auto-generated)
-├── replacements.json           # Word pronunciation replacement dictionary (auto-generated)
+TTS_Audiobook_Converter/
+├── run_pipeline.py                 # ⭐ UNIFIED PIPELINE: Ingest -> Parse -> Tag -> Convert (All-in-One)
+│
+├── Ingestion Tools:
+│   ├── url_to_txt.py               # Playwright web scraper for web fiction & chapters (Reader Mode)
+│   ├── batch_url_to_txt.py         # Batch URL scraper from a list of web links
+│   └── ebook_to_txt.py             # Ebook converter for EPUB, MOBI, PDF, AZW3 to raw text
+│
+├── Processing Tools:
+│   ├── new_text_parser.py          # Cleans and splits raw text into formatted chapter files
+│   ├── llm_dialogue_tagger.py      # Dialogue tagger & tone/emotion detector (Fast Smart Parser & LLM)
+│   └── local_hybrid_audioconverter.py # Simultaneous CPU Kokoro + GPU F5-TTS audio generator
+│
+├── Workspace & Storage:
+│   ├── raw_txt/                    # Source story/book text files
+│   ├── parsed_chapters/            # Chapters split and cleaned by new_text_parser.py
+│   ├── tagged_chapters/            # Chapters tagged with character and emotion markers
+│   ├── wavs/                       # Custom reference voice WAV samples for F5-TTS cloning
+│   ├── finished/                   # Automatically archived completed audiobooks & ZIP packages
+│   ├── test_code/                  # Diagnostic and audio verification test scripts
+│   └── old_code/                   # Archived legacy scripts (e.g. deprecated hybrid_audioconverter.py)
+│
+├── Configuration:
+│   ├── characters.json             # Character-to-voice mapping configuration (auto-generated)
+│   ├── tag_mappings.json           # Character nickname and alias mapping dictionary (auto-generated)
+│   ├── replacements.json           # Phonetic word pronunciation replacement dictionary (auto-generated)
+│   ├── chapters.txt                # Chapter manifest file processed by the audio generator
+│   └── requirements.txt            # Python dependencies
 └── README.md
 ```
 
@@ -48,12 +68,9 @@ An automated text-to-speech (TTS) pipeline designed for creating audiobooks with
 ## Prerequisites
 
 1. **Python 3.10 or 3.11** *(Recommended; avoid Python 3.13+ for PyTorch/F5-TTS compatibility)*.
-2. **FFmpeg**: Required for audio slicing, concatenation, and rubberband pitch adjustment.
+2. **FFmpeg**: Required for audio slicing, concatenation, and encoding.
    * [Download FFmpeg](https://ffmpeg.org/download.html) and ensure `ffmpeg` is added to your system `PATH`.
-3. **Kokoro TTS Server**:
-   * A local Kokoro API running on `http://localhost:8880` (e.g. via Docker, Kokoro-FastAPI, or OpenedAI-Speech).
-4. **NVIDIA GPU with CUDA** *(Recommended)*:
-   * Greatly accelerates F5-TTS voice cloning inference.
+3. **NVIDIA GPU with CUDA** *(Recommended for fast F5-TTS voice cloning; Kokoro runs 100% locally on CPU)*.
 
 ---
 
@@ -61,14 +78,14 @@ An automated text-to-speech (TTS) pipeline designed for creating audiobooks with
 
 ### Option 1: One-Click Setup (Windows)
 Double-click `setup_env.bat` in the project root. This will:
-1. Create a dedicated Python 3.11 virtual environment (`.venv`) using `uv` or standard Python.
+1. Create a dedicated Python 3.11 virtual environment (`.venv`).
 2. Automatically install all dependencies from `requirements.txt`.
 
 ### Option 2: Manual Setup
 Open PowerShell or your terminal in this directory:
 
 ```powershell
-# 1. Create a Python 3.11 virtual environment (with pip seeded)
+# 1. Create a Python 3.11 virtual environment
 uv venv --seed --python 3.11 .venv
 # (or: python -m venv .venv)
 
@@ -76,37 +93,66 @@ uv venv --seed --python 3.11 .venv
 .\.venv\Scripts\activate
 
 # 3. Install dependencies
-# Using uv (fastest):
 uv pip install -r requirements.txt --index-strategy unsafe-best-match
-# (or standard pip):
-pip install -r requirements.txt
+# (or: pip install -r requirements.txt)
 ```
 
 ---
 
-## Step-by-Step Workflow
+## Quick Start: The Unified Pipeline (`run_pipeline.py`)
 
-### Step 1: Add Raw Books
-Place your source `.txt` files into the `raw_txt/` directory.
+The fastest way to generate an audiobook is with the unified runner. Point it to any web link, ebook, or local text file:
 
-### Step 2: Parse and Clean the Text
-Run the parser to clean metadata, remove notes, and split into chapters:
+```powershell
+# From a web fiction / chapter URL:
+python run_pipeline.py "https://archiveofourown.org/works/12345"
 
+# From a local text file:
+python run_pipeline.py raw_txt/my_story.txt
+
+# From an EPUB or PDF ebook:
+python run_pipeline.py "C:\Books\my_book.epub"
+
+# Interactive Menu (choose existing files from raw_txt/):
+python run_pipeline.py
+```
+
+The pipeline automatically handles:
+1. **Ingestion**: Scrapes the URL or converts the ebook into `raw_txt/`.
+2. **Parsing**: Cleans headers/author notes and splits into `parsed_chapters/`.
+3. **Tagging**: Fast Smart Parser tags character quotes and emotional delivery into `tagged_chapters/`.
+4. **Conversion**: Local CPU Kokoro and GPU F5-TTS synthesize audio in parallel, merge MP3s, generate timestamps, and move the finished audiobook into `finished/`.
+
+---
+
+## Advanced Modular Workflow
+
+For full control over each stage, you can also run the modular tools independently:
+
+### Step 1: Ingest Source Material
+* **Web URL**:
+  ```powershell
+  python url_to_txt.py "https://example.com/story/chapter1" --reader
+  ```
+* **Ebook File**:
+  ```powershell
+  python ebook_to_txt.py "C:\Books\sample.epub"
+  ```
+Clean text is automatically saved into `raw_txt/`.
+
+### Step 2: Parse and Clean Chapters (`new_text_parser.py`)
 ```powershell
 python new_text_parser.py
 ```
-
 * **Interactive Prompts**:
   1. **File Selection**: Choose which file from `raw_txt/` to process.
-  2. **Multi-Newline Dividers**: Choose `y` to turn more than one new line in a row (multiple blank lines representing scene transitions) into `***` dividers.
-  3. **Hard-Wrap Healing**: Choose `y` to merge lines split by manual wrapping into natural paragraphs.
+  2. **Multi-Newline Dividers**: Convert consecutive blank lines into `***` scene pauses.
+  3. **Hard-Wrap Healing**: Merge lines split by manual line breaks into natural paragraphs.
   4. **Trailing Section Review**: Review trailing sections chapter-by-chapter (with live excerpts) to remove author notes.
-* Parsed chapters will be saved to `parsed_chapters/` and registered in `chapters.txt`.
-
----
+* Parsed chapters are saved to `parsed_chapters/<BookTitle>/` and registered in `chapters.txt`.
 
 ### Step 3: Configure Character Voices (`characters.json`)
-The first time you run the converter, a default `characters.json` file is created. You can customize the voice roster:
+The voice configuration file maps character names to specific TTS engines and voice profiles:
 
 ```json
 {
@@ -114,106 +160,78 @@ The first time you run the converter, a default `characters.json` file is create
     "engine": "kokoro",
     "voice": "af_bella(0.7)+af_nicole(0.3)",
     "pitch": 1.0,
-    "description": "Default narrator for all untagged text."
+    "speed": 1.0,
+    "description": "Default narrator on CPU for untagged story text."
   },
   "detective": {
     "engine": "kokoro",
     "voice": "am_michael",
-    "pitch": 0.95
+    "pitch": 1.0,
+    "speed": 1.0
   },
   "villain": {
     "engine": "f5tts",
-    "ref_audio": "voices/villain_voice.wav",
+    "ref_audio": "wavs/villain_sample.wav",
     "ref_text": "The exact words spoken in the villain reference clip.",
     "speed": 1.0,
-    "steps": 32
+    "steps": 16,
+    "emotions": {
+      "shout": "wavs/villain_shouting.wav",
+      "whisper": "wavs/villain_whisper.wav"
+    }
   }
 }
 ```
 
-#### Voice Configuration Rules:
-* **`narrator`**: The default fallback. All untagged paragraphs use this voice.
-* **Kokoro Voice Blending**:
+#### Voice Configuration Guidelines:
+* **`narrator`**: The default fallback. All general story text without dialogue tags uses this voice.
+* **Kokoro Voice Blending (CPU)**:
+  * Single voice: `"af_bella"`
   * Equal blend: `"af_bella+af_nicole"`
   * Weighted blend: `"af_bella(0.6)+af_nicole(0.2)+am_michael(0.2)"`
-* **F5-TTS Voice Cloning**:
-  * `ref_audio`: Path to a clean 5–10 second WAV file of the target voice.
-  * `ref_text`: The exact transcript of what is spoken in the reference audio.
-  * `steps`: Flow matching steps (default: `32` for best quality; `16` for faster generation).
+* **F5-TTS Voice Cloning (GPU)**:
+  * `ref_audio`: Path to a clean **5–10 second** WAV audio clip of the target voice.
+  * `ref_text`: The **exact verbatim transcript** of what is spoken in `ref_audio`.
+  * `steps`: Flow-matching diffusion steps (default: `16` for fast, crisp audio; `32` for high steps).
+  * `emotions`: Optional dictionary mapping emotions (`shout`, `whisper`, `sad`) to dedicated reference clips.
 
----
-
-### Step 4: Tag Character Dialogue in Your Chapters
-
-#### Option A: Automatic Dialogue Tagging (Fast Smart Engine & Hybrid LLM)
-Run the dialogue tagger from `new_text_parser.py` or standalone via `llm_dialogue_tagger.py`:
-
+### Step 4: Tag Dialogue (`llm_dialogue_tagger.py`)
 ```powershell
 python llm_dialogue_tagger.py
 ```
+* **[1] Fast Smart Parser (Instant & 100% Quote Coverage - Recommended)**:
+  * Grammar-aware speech verb attribution and conversational turn-taking.
+  * Tags multi-quote lines accurately (`[Hero] "Wait!" [/Hero] he said. [Hero] "Look there." [/Hero]`).
+  * Tags thousands of words in **less than 0.1 seconds**.
+* **[2] Hybrid LLM**: Fast context parser with local GPU micro-prompts (`qwen2.5:7b` via Ollama) for ambiguous multi-character scenes.
+* **Auto-Sync**: Automatically updates `tag_mappings.json` (for nicknames/aliases) and `characters.json` (for voice setup).
 
-Offers 3 optimized modes:
-1. **[1] Fast Smart Parser (Instant & 100% Quote Coverage - Recommended)**:
-   * Uses grammar-aware narrative parsing, speech verb detection, and scene turn-taking.
-   * **100% Quote Coverage**: Never misses quotes—multi-quote lines (e.g. `"Wait a moment," John said. "Look over there."`) have **both** quotes tagged accurately (`[John] "Wait a moment," [/John] John said. [John] "Look over there." [/John]`).
-   * **Blazing Fast**: Tags thousands of words in **less than 0.1 seconds** (no GPU wait).
-2. **[2] Hybrid LLM (Fast Context + GPU LLM Verification)**:
-   * Combines the fast context parser with local GPU micro-prompts (`qwen2.5:7b` via Ollama) for ambiguous multi-character scenes.
-   * 10x-50x faster than full JSON generation while guaranteeing 100% quote coverage.
-3. **[3] Script Form**:
-   * Formats screenplays/scripts (`Alice: Hello` -> `[Alice] "Hello" [/Alice]`).
-* **Auto-Sync**: Automatically updates `tag_mappings.json` (for nicknames/aliases) and `characters.json` (for voice configuration).
-
-#### Option B: Manual Tagging
-You can also manually add tags directly into the text inside `parsed_chapters/`:
-
-##### 1. Inline or Single-Paragraph Tag:
-```text
-The storm grew louder as the stranger kicked open the tavern door.
-
-[villain] "No one leaves this room alive," he growled into the darkness.
-
-The patrons froze in terror, nobody daring to make a sound.
-```
-
-##### 2. Multi-Paragraph Block Tag:
-```text
-[villain]
-"For three long years I waited in that dungeon.
-Every single day, the cold seeped into my bones.
-Now it is your turn to suffer."
-[/villain]
-
-The detective stood unmoving, his hand slowly reaching for his coat.
-```
-
-* Any text without tags automatically defaults back to the `"narrator"` voice.
-
----
-
-### Step 5: Generate the Audiobook
-Ensure your Kokoro server is running at `http://localhost:8880`, then start the converter:
-
+### Step 5: Generate the Audiobook (`local_hybrid_audioconverter.py`)
 ```powershell
-python hybrid_audioconverter.py
+python local_hybrid_audioconverter.py
 ```
+Options:
+* `--emotions`: Enables dialogue tone/emotion delivery (default).
+* `--no-emotions`: Renders pure baseline voices with zero modulation.
 
-The script will:
-1. Render each paragraph chunk (`chunk_001.wav`, `chunk_002.wav`, etc.).
-2. Concatenate the chunks into completed chapter MP3s (`01_Chapter_1_complete.mp3`).
-3. Generate detailed timestamps (`01_Chapter_1_timestamps.txt`).
-4. Package the finished MP3s into a single `.zip` file inside `[BookTitle]_hybrid_audiobook_output/`.
+The generator will:
+1. Render Kokoro chunks on CPU and F5-TTS chunks on GPU concurrently.
+2. Display real-time chunk progress bars for each chapter.
+3. Stitch chunks into completed chapter MP3s (`01_Chapter_1_complete.mp3`).
+4. Generate absolute timestamp logs (`01_Chapter_1_timestamps.txt`) and master production voice rosters (`_voice_roster.txt`).
+5. Package the MP3s into a ZIP archive and archive the entire audiobook into `finished/`.
 
 ---
 
 ## Pronunciation Replacements (`replacements.json`)
 
-To fix phonetic pronunciations (e.g. character names, abbreviations, or fictional terms), add them to `replacements.json`:
+To fix phonetic pronunciations (e.g. abbreviations, titles, or fictional terms), add them to `replacements.json`:
 
 ```json
 {
   "Dr.": "Doctor",
   "Mr.": "Mister",
+  "etc.": "et cetera"
 }
 ```
 `new_text_parser.py` automatically applies these substitutions during the parsing stage.

@@ -1150,38 +1150,34 @@ def clear_chapter_recording(master_output_dir, base_name):
         except Exception: pass
 
 
-def main():
-    safe_print("==================================================================")
-    safe_print("  Simultaneous Hybrid Audiobook Generator (CPU Kokoro + GPU F5)  ")
-    safe_print("==================================================================")
-
-    import argparse
-    parser = argparse.ArgumentParser(description="Simultaneous Hybrid Audiobook Generator (CPU Kokoro + GPU F5)")
-    parser.add_argument("--emotions", dest="enable_emotions", action="store_true", default=None, help="Enable dialogue tone/emotion effects (speed & pitch modulation).")
-    parser.add_argument("--no-emotions", dest="enable_emotions", action="store_false", help="Disable dialogue tone/emotion effects (pure clean baseline voices).")
-    args, _ = parser.parse_known_args()
-
-    enable_emotions = args.enable_emotions
+def convert_audiobook(manifest_file=MANIFEST_FILE, enable_emotions=None, interactive=True):
+    """
+    Renders an audiobook from a chapter manifest using simultaneous CPU Kokoro and GPU F5-TTS.
+    Returns True on success, False on error.
+    """
     if enable_emotions is None:
-        safe_print("\nDialogue Tone & Emotion Delivery:")
-        safe_print("  [1] Enabled  - Apply tone modulation (whisper, shout, angry, etc.) [Default]")
-        safe_print("  [2] Disabled - Pure baseline voices only (zero speed/pitch distortion)")
-        emo_choice = input("Select option [1 or 2] (default 1): ").strip()
-        enable_emotions = (emo_choice != "2")
+        if interactive:
+            safe_print("\nDialogue Tone & Emotion Delivery:")
+            safe_print("  [1] Enabled  - Apply tone modulation (whisper, shout, angry, etc.) [Default]")
+            safe_print("  [2] Disabled - Pure baseline voices only (zero speed/pitch distortion)")
+            emo_choice = input("Select option [1 or 2] (default 1): ").strip()
+            enable_emotions = (emo_choice != "2")
+        else:
+            enable_emotions = True
 
     safe_print(f"[*] Tone & Emotion Mode: {'ENABLED (Acoustic Modulation)' if enable_emotions else 'DISABLED (Pure Baseline)'}")
 
-    if not os.path.exists(MANIFEST_FILE):
-        safe_print(f"Error: Could not find manifest file '{MANIFEST_FILE}'.")
-        safe_print(f"Tip: Run 'new_text_parser.py' first to format chapters into '{MANIFEST_FILE}'.")
-        return
+    if not os.path.exists(manifest_file):
+        safe_print(f"Error: Could not find manifest file '{manifest_file}'.")
+        safe_print(f"Tip: Run 'new_text_parser.py' first to format chapters into '{manifest_file}'.")
+        return False
 
-    with open(MANIFEST_FILE, "r", encoding="utf-8") as mf:
+    with open(manifest_file, "r", encoding="utf-8") as mf:
         chapter_files = [line.strip() for line in mf if line.strip() and not line.startswith("#")]
 
     if not chapter_files:
-        safe_print(f"Error: Manifest file '{MANIFEST_FILE}' is empty.")
-        return
+        safe_print(f"Error: Manifest file '{manifest_file}' is empty.")
+        return False
 
     # Load character profiles and tag mappings
     characters = load_characters()
@@ -1245,7 +1241,7 @@ def main():
             "status": status,
         })
 
-    if has_existing:
+    if has_existing and interactive:
         safe_print("\n" + "=" * 70)
         safe_print("                 Existing Audio Sections Detected")
         safe_print("=" * 70)
@@ -1283,6 +1279,8 @@ def main():
                 safe_print("[*] All other completed sections will be kept and skipped automatically.\n")
             else:
                 safe_print("[-] No valid sections entered. Resuming standard progress.")
+    elif has_existing and not interactive:
+        safe_print("\n[*] Existing audio sections detected. Resuming automatically (skipping completed).")
 
     # ==================== MAIN PROCESSING LOOP ====================
     for idx, txt_file in enumerate(chapter_files, 1):
@@ -1290,7 +1288,7 @@ def main():
         success = process_hybrid_chapter_simultaneous(txt_file, characters, master_output_dir, tag_mappings=tag_mappings, enable_emotions=enable_emotions)
         if not success:
             safe_print(f"[!] Pausing due to error in {txt_file}.")
-            break
+            return False
 
     # Package into ZIP archive if multiple chapters
     if len(chapter_files) > 1:
@@ -1310,6 +1308,7 @@ def main():
         for f in chapter_files
     )
 
+    dest_folder = master_output_dir
     if all_finished:
         os.makedirs(FINISHED_DIR, exist_ok=True)
         dest_folder = os.path.join(FINISHED_DIR, os.path.basename(master_output_dir))
@@ -1322,6 +1321,22 @@ def main():
     safe_print("\n==================================================================")
     safe_print("       Simultaneous Hybrid Audiobook Processing Finished!         ")
     safe_print("==================================================================")
+    return True
+
+
+def main():
+    safe_print("==================================================================")
+    safe_print("  Simultaneous Hybrid Audiobook Generator (CPU Kokoro + GPU F5)  ")
+    safe_print("==================================================================")
+
+    import argparse
+    parser = argparse.ArgumentParser(description="Simultaneous Hybrid Audiobook Generator (CPU Kokoro + GPU F5)")
+    parser.add_argument("--manifest", default=MANIFEST_FILE, help="Path to manifest file listing chapters (default: chapters.txt).")
+    parser.add_argument("--emotions", dest="enable_emotions", action="store_true", default=None, help="Enable dialogue tone/emotion effects (speed & pitch modulation).")
+    parser.add_argument("--no-emotions", dest="enable_emotions", action="store_false", help="Disable dialogue tone/emotion effects (pure clean baseline voices).")
+    args, _ = parser.parse_known_args()
+
+    convert_audiobook(manifest_file=args.manifest, enable_emotions=args.enable_emotions, interactive=True)
 
 
 if __name__ == "__main__":

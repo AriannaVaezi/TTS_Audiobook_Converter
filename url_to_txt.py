@@ -153,10 +153,26 @@ def scrape_url_to_txt(
             print("[*] Reader Mode enabled — extracting main article content...")
             extracted_html = page.evaluate("""
                 async () => {
+                    // 1. Direct container extraction for fiction platforms (AO3, ao3saver, Royal Road, FFnet, etc.)
+                    const directContainer = document.querySelector(
+                        '#chapters, #workskin, .chapter-inner, #storytext, .chp_raw, .entry-content'
+                    );
+                    if (directContainer && directContainer.innerText && directContainer.innerText.trim().length > 300) {
+                        return `<h1>${document.title}</h1>` + directContainer.innerHTML;
+                    }
+
+                    // 2. Readability.js for generic articles / blogs, protecting chapter headings
                     let html = "";
                     try {
                         const mod = await import('https://cdn.skypack.dev/@mozilla/readability');
-                        const article = new mod.Readability(document.cloneNode(true)).parse();
+                        const clone = document.cloneNode(true);
+                        // Prevent Readability from discarding chapter headers wrapped in meta/byline containers
+                        clone.querySelectorAll('.meta, .byline, .header').forEach(el => {
+                            if (el.querySelector('h1, h2, h3, h4, h5, h6') || /chapter/i.test(el.className)) {
+                                el.classList.remove('meta', 'byline', 'header');
+                            }
+                        });
+                        const article = new mod.Readability(clone).parse();
                         if (article && article.content) {
                             html = `<h1>${article.title || document.title}</h1>` + article.content;
                         }

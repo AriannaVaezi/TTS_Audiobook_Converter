@@ -333,6 +333,7 @@ def clean_web_fiction_header_and_metadata(raw_text, input_file_path):
     if ao3_m:
         work_title = ao3_m.group(1).strip()
         author = ao3_m.group(2).strip()
+        is_ao3 = True
     elif is_ao3:
         pref_m = re.search(r"(?im)^Preface\s*\n+([^\n]+)\n+\s*Posted originally on the Archive of Our Own", raw_text)
         if pref_m:
@@ -371,6 +372,12 @@ def clean_web_fiction_header_and_metadata(raw_text, input_file_path):
         clean_file_base = clean_file_base[:56] + ".txt"
 
     body_text = raw_text
+
+    # Strip top platform metadata header (e.g. Title - Author - Fandom/Tags) so it never leaks into story content
+    if first_line and (ao3_m or is_ellipsus or (work_title and work_title in first_line and "-" in first_line)):
+        first_line_end = body_text.find("\n")
+        if first_line_end != -1:
+            body_text = body_text[first_line_end + 1:].strip()
 
     # Pre-clean AO3 preamble / summary / notes for single works
     if is_ao3 and work_title:
@@ -439,6 +446,12 @@ def parse_book_file(
 
     # Rule 2: Chapter Detection
     # Chapters title are single line, typically 'Chapter [#]' or 'Chapter [#]: [title]'
+    WORD_TO_NUM = {
+        "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+        "eleven": 11, "twelve": 12, "thirteen": 13, "fourteen": 14, "fifteen": 15, "sixteen": 16, "seventeen": 17, "eighteen": 18, "nineteen": 19, "twenty": 20,
+        "i": 1, "ii": 2, "iii": 3, "iv": 4, "v": 5, "vi": 6, "vii": 7, "viii": 8, "ix": 9, "x": 10
+    }
+
     chapter_pattern = r"(?im)^\s*(Chapter\s+(\d+)(?:\s*[:\-]\s*(.*))?)\s*$"
     all_matches = list(re.finditer(chapter_pattern, raw_text))
 
@@ -447,7 +460,7 @@ def parse_book_file(
         start_idx = match.start(1)
         full_line = match.group(1).strip()
 
-        # Ignore table of contents lines with trailing dots/spaces and page numbers (e.g. Chapter 1 ..... 15)
+        # Ignore table of contents lines with trailing dots/spaces and page numbers
         if re.search(r"(?:\.{2,}|\s{3,})\s*\d+$", full_line):
             continue
 
@@ -464,6 +477,44 @@ def parse_book_file(
             "num": chap_num,
             "title": chap_title,
         })
+
+    # Fallback Chapter Detection: If no standard 'Chapter N' found, check for 'Chapter One' or standalone word numbers
+    if not valid_splits:
+        word_chapter_pat = r"(?im)^\s*(?:Chapter\s+([a-zA-Z]+)(?:\s*[:\-]\s*(.*))?)\s*$"
+        for match in re.finditer(word_chapter_pat, raw_text):
+            word_part = match.group(1).strip().lower()
+            if word_part in WORD_TO_NUM:
+                start_idx = match.start(0)
+                if valid_splits and start_idx - valid_splits[-1]["start"] < 100:
+                    continue
+                chap_num = WORD_TO_NUM[word_part]
+                chap_title = match.group(2).strip() if match.group(2) else ""
+                valid_splits.append({
+                    "start": start_idx,
+                    "header": match.group(0).strip(),
+                    "num": chap_num,
+                    "title": chap_title,
+                })
+
+    # Secondary Fallback: Standalone number words on their own line (e.g. 'One', 'Two', 'Three')
+    if not valid_splits:
+        standalone_pat = r"(?im)^\s*(One|Two|Three|Four|Five|Six|Seven|Eight|Nine|Ten|Eleven|Twelve|Thirteen|Fourteen|Fifteen|Sixteen|Seventeen|Eighteen|Nineteen|Twenty)\s*$"
+        standalone_matches = list(re.finditer(standalone_pat, raw_text))
+        if len(standalone_matches) >= 2:
+            expected_num = 1
+            for match in standalone_matches:
+                w = match.group(1).strip().lower()
+                n = WORD_TO_NUM.get(w, 0)
+                start_idx = match.start(0)
+                # Verify sequential order and reasonable chapter spacing
+                if n == expected_num and (not valid_splits or start_idx - valid_splits[-1]["start"] > 200):
+                    valid_splits.append({
+                        "start": start_idx,
+                        "header": f"Chapter {n}: {match.group(1).strip()}",
+                        "num": n,
+                        "title": match.group(1).strip(),
+                    })
+                    expected_num += 1
 
     book_output_dir = os.path.join(OUTPUT_DIR, safe_work_title)
     os.makedirs(book_output_dir, exist_ok=True)
