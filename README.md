@@ -22,7 +22,8 @@ An automated text-to-speech (TTS) pipeline designed for creating audiobooks with
   * **Fast Smart Parser (Instant & 100% Quote Coverage)**: Grammar-aware speech verb detection and conversational turn-taking tags entire books in seconds with zero GPU wait.
   * **Dialogue Emotion Routing**: Detects conversational tones (whisper, shout, calm, sad, etc.) and routes them to character emotion reference clips with zero synthetic distortion.
 * **Robust Audio Generation & Production**:
-  * **Upfront Re-record Scanner**: Scans all sections at launch and lets you selectively re-record specific chapters (or resume automatically).
+  * **Per-Voice Volume Control & Alt Voices**: Configure explicit `"volume"` multipliers and named `"alts"` / `"alt_voices"` in `characters.json`, toggle auto-balanced vs. raw volume at startup (or edit volumes interactively), and trigger alt voices via `[Character:alt_name]`.
+  * **Chunk-Level Re-Record & Voice Switching**: Scans sections at launch to resume, re-record sections, or pick exact chunk numbers to re-record, switch to another character, switch to the same character's emotion/alt voice, or tune chunk volume without losing untouched chunks.
   * **Automatic Archiving**: Completed audiobook folders are automatically moved to a dedicated `finished/` directory.
   * **Timestamp Tracking**: Generates an absolute timestamp log (`_timestamps.txt`) and master production voice roster (`_voice_roster.txt`).
   * **Automatic Packaging**: Combines all finished chapter MP3s into a ZIP archive.
@@ -161,23 +162,36 @@ The voice configuration file maps character names to specific TTS engines and vo
     "voice": "af_bella(0.7)+af_nicole(0.3)",
     "pitch": 1.0,
     "speed": 1.0,
+    "volume": 1.0,
+    "alts": {
+      "storyteller": "bm_george"
+    },
     "description": "Default narrator on CPU for untagged story text."
   },
   "detective": {
     "engine": "kokoro",
     "voice": "am_michael",
     "pitch": 1.0,
-    "speed": 1.0
+    "speed": 1.0,
+    "volume": 1.0
   },
   "villain": {
     "engine": "f5tts",
     "ref_audio": "wavs/villain_sample.wav",
     "ref_text": "The exact words spoken in the villain reference clip.",
     "speed": 1.0,
+    "volume": 1.05,
     "steps": 16,
     "emotions": {
       "shout": "wavs/villain_shouting.wav",
       "whisper": "wavs/villain_whisper.wav"
+    },
+    "alts": {
+      "calm_disguise": {
+        "ref_audio": "wavs/villain_alt.wav",
+        "ref_text": "An alternate calm vocal take for this character.",
+        "volume": 0.95
+      }
     }
   }
 }
@@ -185,6 +199,7 @@ The voice configuration file maps character names to specific TTS engines and vo
 
 #### Voice Configuration Guidelines:
 * **`narrator`**: The default fallback. All general story text without dialogue tags uses this voice.
+* **`volume`**: Optional loudness multiplier (`1.0` default; `<1.0` quieter, `>1.0` louder). Works per-character and per-emotion/alt entry. Can also be edited interactively at startup.
 * **Kokoro Voice Blending (CPU)**:
   * Single voice: `"af_bella"`
   * Equal blend: `"af_bella+af_nicole"`
@@ -193,7 +208,8 @@ The voice configuration file maps character names to specific TTS engines and vo
   * `ref_audio`: Path to a clean **5–10 second** WAV audio clip of the target voice.
   * `ref_text`: The **exact verbatim transcript** of what is spoken in `ref_audio`.
   * `steps`: Flow-matching diffusion steps (default: `16` for fast, crisp audio; `32` for high steps).
-  * `emotions`: Optional dictionary mapping emotions (`shout`, `whisper`, `sad`) to dedicated reference clips.
+  * `emotions`: Optional dictionary mapping emotions (`shout`, `whisper`, `sad`) to dedicated reference clips (disabled when `--no-emotions` is set).
+  * `alts` (or `alt_voices`): Optional dictionary mapping custom alternate voices (usable via `[Villain:calm_disguise]` or the chunk re-record menu; remains active even when `--no-emotions` is used).
 
 ### Step 4: Tag Dialogue (`llm_dialogue_tagger.py`)
 ```powershell
@@ -212,7 +228,13 @@ python local_hybrid_audioconverter.py
 ```
 Options:
 * `--emotions`: Enables dialogue tone/emotion delivery (default).
-* `--no-emotions`: Renders pure baseline voices with zero modulation.
+* `--no-emotions`: Renders pure baseline voices (custom `alts` voices still remain active).
+* `--no-volume-balance`: Disables automatic loudness balancing and only applies explicit `"volume"` multipliers.
+* `--rerecord`: Opens the interactive **Chunk Re-Record & Voice Switcher** directly on launch.
+
+Interactive Features:
+* **Voice Volume Options**: Choose between Auto-balanced (`volume` multipliers applied), Unbalanced / Raw (`volume` multipliers only), or open the live Volume Adjustment Editor to update `characters.json`.
+* **Chunk-Level Re-Recording (`[4]` or `--rerecord`)**: Pick specific chunk numbers (`2`, `5-7`, `all`) inside any chapter to re-record, switch to another character, switch to one of the same character's emotion/alt voices, adjust chunk volume, or reset chunks while keeping all other chunks untouched (`chunk_overrides.json`).
 
 The generator will:
 1. Render Kokoro chunks on CPU and F5-TTS chunks on GPU concurrently.

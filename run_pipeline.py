@@ -176,6 +176,8 @@ def run_full_pipeline(
     should_convert_multi_nl: bool = False,
     skip_audio: bool = False,
     interactive: bool = False,
+    normalize_volume: bool = True,
+    force_rerecord_menu: bool = False,
 ):
     """
     Executes all stages of the audiobook generator:
@@ -248,11 +250,14 @@ def run_full_pipeline(
     print(f"  • General Narration : CPU Kokoro (Neural Speech)")
     print(f"  • Dialogue / Clones : GPU F5-TTS (Flow-Matching)")
     print(f"  • Emotion Delivery  : {'ENABLED' if enable_emotions else 'DISABLED (Pure Baseline)'}")
+    print(f"  • Volume Mode       : {'Auto-Balanced' if normalize_volume else 'Raw (Per-Voice Multipliers Only)'}")
 
     success = lha.convert_audiobook(
         manifest_file=MANIFEST_FILE,
         enable_emotions=enable_emotions,
         interactive=interactive,
+        normalize_volume=normalize_volume,
+        force_rerecord_menu=force_rerecord_menu,
     )
 
     if success:
@@ -326,6 +331,19 @@ def main():
         default=False,
         help="Only perform ingestion, parsing, and tagging without rendering audio.",
     )
+    parser.add_argument(
+        "--no-volume-balance",
+        dest="normalize_volume",
+        action="store_false",
+        default=True,
+        help="Disable automatic active-speech loudness balancing (keeps explicit per-voice 'volume' multipliers).",
+    )
+    parser.add_argument(
+        "--rerecord",
+        action="store_true",
+        default=False,
+        help="Open chunk-level re-record / voice switching menu before rendering audio.",
+    )
 
     args = parser.parse_args()
 
@@ -360,7 +378,9 @@ def main():
         should_unwrap=args.unwrap,
         should_convert_multi_nl=args.multi_nl,
         skip_audio=args.skip_audio,
-        interactive=is_interactive,
+        interactive=is_interactive or args.rerecord,
+        normalize_volume=args.normalize_volume,
+        force_rerecord_menu=args.rerecord,
     )
 
 

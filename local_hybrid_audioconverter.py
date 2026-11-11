@@ -103,6 +103,7 @@ def ensure_characters_file():
                 "voice": "af_bella",
                 "pitch": 1.0,
                 "speed": 1.0,
+                "volume": 1.0,
                 "description": "Default narrator voice on CPU for general story text."
             },
             "detective": {
@@ -110,6 +111,7 @@ def ensure_characters_file():
                 "voice": "am_michael",
                 "pitch": 0.95,
                 "speed": 1.0,
+                "volume": 1.0,
                 "description": "Example male character using Kokoro on CPU."
             },
             "villain": {
@@ -119,6 +121,9 @@ def ensure_characters_file():
                 "speed": 1.0,
                 "pitch": 1.0,
                 "steps": 32,
+                "volume": 1.0,
+                "emotions": {},
+                "alts": {},
                 "description": "Example character using F5-TTS zero-shot voice cloning on GPU."
             }
         }
@@ -191,17 +196,28 @@ def apply_pitch_shift(input_path, output_path, pitch_factor):
     os.system(cmd)
 
 
-def normalize_chunk_volume(wav_path, emotion="", volume_scale=1.0, max_peak=0.88):
+def normalize_chunk_volume(wav_path, emotion="", volume_scale=1.0, max_peak=0.88, auto_balance=True):
     """
-    Balances active-speech loudness across Kokoro and F5-TTS chunks so characters
-    and emotions sit smoothly at consistent volume without clipping.
-    Measures active non-silent frames so long pauses do not skew gain.
+    Balances active-speech loudness across Kokoro and F5-TTS chunks and applies per-voice
+    volume multipliers cleanly without clipping.
+    When auto_balance=False, preserves natural relative amplitude and applies volume_scale directly.
     """
     try:
         data, sr = sf.read(wav_path)
     except Exception:
         return
     if data.size == 0:
+        return
+
+    vol = float(volume_scale)
+    if not auto_balance:
+        if abs(vol - 1.0) < 1e-4:
+            return
+        scaled = data * max(0.05, min(4.0, vol))
+        peak = float(np.max(np.abs(scaled)))
+        if peak > 0.95:
+            scaled = scaled * (0.95 / peak)
+        sf.write(wav_path, scaled, sr)
         return
 
     mono = data.mean(axis=1) if data.ndim > 1 else data
@@ -227,7 +243,7 @@ def normalize_chunk_volume(wav_path, emotion="", volume_scale=1.0, max_peak=0.88
     else:
         target_rms = 0.075
 
-    target_rms *= float(volume_scale)
+    target_rms *= vol
     gain = max(0.35, min(3.0, target_rms / cur_rms))
 
     scaled = data * gain
@@ -268,8 +284,8 @@ def apply_warm_eq(wav_path):
                 pass
 
 
-def _finalize_rendered_chunk(temp_raw, chunk_file, task):
-    """Applies optional pitch shift, studio warmth EQ (for F5-TTS), and volume balancing."""
+def _finalize_rendered_chunk(temp_raw, chunk_file, task, normalize_volume=True):
+    """Applies optional pitch shift, studio warmth EQ (for F5-TTS), and volume adjustment."""
     pitch = task["pitch_factor"]
     if pitch != 1.0:
         apply_pitch_shift(temp_raw, chunk_file, pitch)
@@ -285,6 +301,7 @@ def _finalize_rendered_chunk(temp_raw, chunk_file, task):
         chunk_file,
         emotion=task.get("emotion", ""),
         volume_scale=task.get("volume_scale", 1.0),
+        auto_balance=normalize_volume,
     )
 
 
@@ -330,24 +347,88 @@ def format_time(seconds):
 
 # ==================== PARSING & HYBRID CHUNKING ====================
 
-def resolve_character_emotion_config(char_cfg, emotion="", enable_emotions=True):
+def _collect_variants(char_cfg):
+    """Returns (emotions_dict, alts_dict) with lowercase keys for case-insensitive lookup."""
+    raw_emo = char_cfg.get("emotions", {}) or {}
+    emotions = {str(k).strip().lower(): v for k, v in raw_emo.items()} if isinstance(raw_emo, dict) else {}
+
+    alts = {}
+    for field in ("alts", "alt_voices", "alt"):
+        raw_alt = char_cfg.get(field, {})
+        if isinstance(raw_alt, dict):
+            for k, v in raw_alt.items():
+                alts[str(k).strip().lower()] = v
+    return emotions, alts
+
+
+def get_character_variants(char_cfg):
+    """Returns list of (variant_name, kind, entry_value) across emotions and alt voices."""
+    emotions, alts = _collect_variants(char_cfg)
+    variants = []
+    for k, v in emotions.items():
+        variants.append((k, "emotion", v))
+    for k, v in alts.items():
+        variants.append((k, "alt", v))
+    return variants
+
+
+def _is_alt_variant(char_name, variant_name, characters_map):
+    """Checks if a tag suffix resolves to an explicit alt voice for the character."""
+    if not variant_name or not characters_map:
+        return False
+    cfg = characters_map.get(char_name.lower(), {})
+    _, alts = _collect_variants(cfg)
+    return variant_name.strip().lower() in alts
+
+
+def _apply_variant_entry(resolved, variant_key, variant_kind, matched_entry):
+    """Applies a matched emotion or alt-voice override dict/string onto resolved voice config."""
+    if isinstance(matched_entry, dict):
+        for k, v in matched_entry.items():
+            resolved[k] = v
+        if "engine" not in matched_entry:
+            if "ref_audio" in matched_entry and "voice" not in matched_entry:
+                resolved["engine"] = "f5tts"
+            elif "voice" in matched_entry and "ref_audio" not in matched_entry:
+                resolved["engine"] = "kokoro"
+    elif isinstance(matched_entry, str):
+        eng = str(resolved.get("engine", "kokoro")).lower()
+        looks_like_file = matched_entry.lower().endswith((".wav", ".mp3", ".flac", ".ogg")) or "/" in matched_entry or "\\" in matched_entry
+        if eng not in ["f5tts", "f5-tts"] and not looks_like_file:
+            resolved["voice"] = matched_entry
+        else:
+            resolved["ref_audio"] = matched_entry
+            if looks_like_file:
+                resolved["engine"] = "f5tts"
+    resolved["active_emotion"] = variant_key
+    resolved["active_variant_kind"] = variant_kind
+    return resolved
+
+
+def resolve_character_emotion_config(char_cfg, emotion="", enable_emotions=True, force_variant=False):
     """
-    Resolves voice parameters applying reference-audio emotion overrides.
-    If an emotion (e.g. 'shout', 'whisper') is configured in char_cfg['emotions']
-    with its own reference audio clip, switches to that clip for authentic vocal delivery.
-    If the emotion is not defined in characters.json, or enable_emotions is False,
-    cleanly falls back to the character's baseline profile at native 1.0x speed and pitch
-    with zero synthetic distortion.
+    Resolves voice parameters applying emotion and/or alt-voice overrides.
+    - Alt voices ('alts' / 'alt_voices') always apply when tagged or chosen manually.
+    - Emotion voices ('emotions') apply when enable_emotions=True or force_variant=True.
     """
     resolved = dict(char_cfg)
-    # Always keep speed and pitch at character baseline (no synthetic distortion)
     resolved["speed"] = float(char_cfg.get("speed", 1.0))
     resolved["pitch"] = float(char_cfg.get("pitch", 1.0))
+    resolved["volume"] = float(char_cfg.get("volume", 1.0))
 
-    if not enable_emotions or not emotion:
+    if not emotion:
         return resolved
 
-    emotion = emotion.lower()
+    variant = str(emotion).strip().lower()
+    emotions, alts = _collect_variants(char_cfg)
+
+    # Check alt voices first (always active even if acoustic emotions are off)
+    if variant in alts:
+        return _apply_variant_entry(resolved, variant, "alt", alts[variant])
+
+    if not enable_emotions and not force_variant:
+        return resolved
+
     EMOTION_ALIASES = {
         "shouting": "shout",
         "whispering": "whisper",
@@ -356,27 +437,11 @@ def resolve_character_emotion_config(char_cfg, emotion="", enable_emotions=True)
         "crying": "sad",
         "laughing": "happy",
     }
-    lookup_keys = [emotion, EMOTION_ALIASES.get(emotion, emotion)]
-
-    custom_emotions = char_cfg.get("emotions", {})
-    matched_entry = None
+    lookup_keys = [variant, EMOTION_ALIASES.get(variant, variant)]
     for k in lookup_keys:
-        if k in custom_emotions:
-            matched_entry = custom_emotions[k]
-            break
+        if k in emotions:
+            return _apply_variant_entry(resolved, variant, "emotion", emotions[k])
 
-    if matched_entry:
-        if isinstance(matched_entry, dict):
-            for k, v in matched_entry.items():
-                resolved[k] = v
-            resolved["active_emotion"] = emotion
-            return resolved
-        elif isinstance(matched_entry, str):
-            resolved["ref_audio"] = matched_entry
-            resolved["active_emotion"] = emotion
-            return resolved
-
-    # Fallback: clean baseline voice, zero distortion
     return resolved
 
 
@@ -396,21 +461,27 @@ def write_production_voice_roster(master_output_dir, book_title_base, characters
             for c in f5_chars:
                 disp = c.get("display_name", "Unknown")
                 ref = c.get("ref_audio", "N/A")
-                steps = c.get("steps", 16)
+                steps = c.get("steps", 32)
                 speed = c.get("speed", 1.0)
                 pitch = c.get("pitch", 1.0)
+                volume = c.get("volume", 1.0)
                 desc = c.get("description", "")
                 f.write(f"  • [{disp}]\n")
                 f.write(f"      Ref Audio : {ref}\n")
-                f.write(f"      Settings  : steps={steps}, speed={speed}, pitch={pitch}\n")
+                f.write(f"      Settings  : steps={steps}, speed={speed}, pitch={pitch}, volume={volume}\n")
                 if desc:
                     f.write(f"      Notes     : {desc}\n")
-                emotions = c.get("emotions", {})
+                emotions, alts = _collect_variants(c)
                 if emotions:
                     f.write("      Emotion Ref Clips:\n")
                     for emo_k, emo_v in emotions.items():
                         r_clip = emo_v.get("ref_audio") if isinstance(emo_v, dict) else emo_v
                         f.write(f"        - [{emo_k}]: {r_clip}\n")
+                if alts:
+                    f.write("      Alt Voices:\n")
+                    for alt_k, alt_v in alts.items():
+                        r_clip = (alt_v.get("ref_audio") or alt_v.get("voice")) if isinstance(alt_v, dict) else alt_v
+                        f.write(f"        - [{alt_k}]: {r_clip}\n")
                 f.write("\n")
         else:
             f.write("  (No F5-TTS characters configured)\n\n")
@@ -424,15 +495,18 @@ def write_production_voice_roster(master_output_dir, book_title_base, characters
             voice = c.get("voice", "af_bella")
             speed = c.get("speed", 1.0)
             pitch = c.get("pitch", 1.0)
+            volume = c.get("volume", 1.0)
             desc = c.get("description", "")
             f.write(f"  • [{disp}]\n")
             f.write(f"      Voice     : {voice}\n")
-            f.write(f"      Settings  : speed={speed}, pitch={pitch}\n")
+            f.write(f"      Settings  : speed={speed}, pitch={pitch}, volume={volume}\n")
             if desc:
                 f.write(f"      Notes     : {desc}\n")
-            emotions = c.get("emotions", {})
+            emotions, alts = _collect_variants(c)
             if emotions:
                 f.write(f"      Emotions  : {', '.join(emotions.keys())}\n")
+            if alts:
+                f.write(f"      Alt Voices: {', '.join(alts.keys())}\n")
             f.write("\n")
 
         f.write("======================================================================\n")
@@ -462,6 +536,14 @@ def split_text_into_tagged_blocks(text, default_character="narrator", characters
         if tag_mappings and t_clean in tag_mappings:
             return tag_mappings[t_clean].lower()
         return t_clean
+
+    def resolve_variant(char_key, raw_tag):
+        if not raw_tag:
+            return ""
+        v = raw_tag.strip().lower()
+        if enable_emotions or _is_alt_variant(char_key, v, characters_map):
+            return v
+        return ""
 
     current_char = resolve_char(default_character)
     current_emotion = ""
@@ -498,7 +580,7 @@ def split_text_into_tagged_blocks(text, default_character="narrator", characters
         if open_block_match:
             in_explicit_block = True
             current_char = resolve_char(open_block_match.group(1))
-            current_emotion = (open_block_match.group(2).lower() if open_block_match.group(2) else "") if enable_emotions else ""
+            current_emotion = resolve_variant(current_char, open_block_match.group(2))
             continue
 
         # 4. Check for embedded inline tags: e.g. Narration [Hero:whisper] "Dialogue" [/Hero] Narration
@@ -518,7 +600,7 @@ def split_text_into_tagged_blocks(text, default_character="narrator", characters
                         "text": before
                     })
                 char_name = resolve_char(match.group(1))
-                emotion = (match.group(2).lower() if match.group(2) else "") if enable_emotions else ""
+                emotion = resolve_variant(char_name, match.group(2))
                 dialogue = match.group(3).strip()
                 if dialogue:
                     blocks.append({
@@ -542,7 +624,7 @@ def split_text_into_tagged_blocks(text, default_character="narrator", characters
         prefix_match = re.match(r"^\[\s*([a-zA-Z0-9_\-]+)(?::([a-zA-Z0-9_\-]+))?\s*\]\s*(.*)$", raw_line)
         if prefix_match and not in_explicit_block:
             char_name = resolve_char(prefix_match.group(1))
-            emotion = (prefix_match.group(2).lower() if prefix_match.group(2) else "") if enable_emotions else ""
+            emotion = resolve_variant(char_name, prefix_match.group(2))
             content = prefix_match.group(3).strip()
             if content:
                 blocks.append({
@@ -574,7 +656,7 @@ def split_text_into_tagged_blocks(text, default_character="narrator", characters
 
         if (merged_chunks and merged_chunks[-1]["type"] == "VOICE"
                 and merged_chunks[-1]["character"] == char
-                and (not enable_emotions or merged_chunks[-1].get("emotion", "") == emotion)):
+                and merged_chunks[-1].get("emotion", "") == emotion):
             prev_len = len(merged_chunks[-1]["text"])
             char_cfg = (characters_map or {}).get(char.lower(), {})
             is_f5 = char_cfg.get("engine", "").lower() in ["f5tts", "f5-tts"] or "f5" in char.lower()
@@ -798,7 +880,97 @@ def render_f5tts_chunk_local(text, char_cfg, output_wav, temp_dir, chunk_index):
 
 # ==================== PARALLEL CHAPTER PROCESSING ====================
 
-def process_hybrid_chapter_simultaneous(txt_filename, characters_map, master_output_dir, tag_mappings=None, enable_emotions=True):
+CHUNK_OVERRIDES_FILENAME = "chunk_overrides.json"
+
+
+def load_chunk_overrides(chunk_dir):
+    """Loads per-chunk voice/emotion/alt/volume overrides stored inside a chapter's chunks directory."""
+    ov_path = os.path.join(chunk_dir, CHUNK_OVERRIDES_FILENAME)
+    if not os.path.exists(ov_path):
+        return {}
+    try:
+        with open(ov_path, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        return {str(k): v for k, v in raw.items() if isinstance(v, dict)}
+    except Exception:
+        return {}
+
+
+def save_chunk_overrides(chunk_dir, overrides):
+    """Persists per-chunk voice/emotion/alt/volume overrides inside a chapter's chunks directory."""
+    os.makedirs(chunk_dir, exist_ok=True)
+    ov_path = os.path.join(chunk_dir, CHUNK_OVERRIDES_FILENAME)
+    with open(ov_path, "w", encoding="utf-8") as f:
+        json.dump(overrides, f, indent=4)
+
+
+def apply_chunk_override_action(
+    txt_filename,
+    master_output_dir,
+    chunk_indices,
+    new_char=None,
+    new_variant=None,
+    set_variant=False,
+    new_volume=None,
+    clear_override=False,
+):
+    """
+    Invalidates selected chunks (and the merged chapter MP3/timestamps) so they are freshly
+    re-recorded on the next render pass, optionally overriding or clearing character,
+    emotion/alt voice, and/or volume multiplier persistently in chunk_overrides.json.
+    """
+    base_name = os.path.splitext(os.path.basename(txt_filename))[0]
+    chunk_dir = os.path.join(master_output_dir, "chunks_" + base_name)
+    final_mp3 = os.path.join(master_output_dir, f"{base_name}_complete.mp3")
+    timestamp_file = os.path.join(master_output_dir, f"{base_name}_timestamps.txt")
+
+    os.makedirs(chunk_dir, exist_ok=True)
+    overrides = load_chunk_overrides(chunk_dir)
+    ov_path = os.path.join(chunk_dir, CHUNK_OVERRIDES_FILENAME)
+
+    updated = []
+    for c_idx in chunk_indices:
+        c_key = str(c_idx)
+        wav_p = os.path.join(chunk_dir, f"chunk_{c_idx:03d}.wav")
+        if os.path.exists(wav_p):
+            try:
+                os.remove(wav_p)
+            except Exception:
+                pass
+
+        if clear_override:
+            overrides.pop(c_key, None)
+        elif new_char is not None or set_variant or new_volume is not None:
+            entry = dict(overrides.get(c_key, {}))
+            if new_char is not None:
+                entry["character"] = new_char.lower()
+            if set_variant:
+                entry["variant"] = (new_variant or "").strip().lower()
+            if new_volume is not None:
+                entry["volume"] = float(new_volume)
+            overrides[c_key] = entry
+        updated.append(c_idx)
+
+    if overrides:
+        save_chunk_overrides(chunk_dir, overrides)
+    elif clear_override and os.path.exists(ov_path):
+        try:
+            os.remove(ov_path)
+        except Exception:
+            pass
+
+    # Remove only the merged chapter MP3 & timestamps so untouched chunks resume instantly
+    for artifact in (final_mp3, timestamp_file):
+        if os.path.exists(artifact):
+            try:
+                os.remove(artifact)
+            except Exception:
+                pass
+
+    return updated
+
+
+def process_hybrid_chapter_simultaneous(txt_filename, characters_map, master_output_dir, tag_mappings=None, enable_emotions=True, normalize_volume=True):
     """
     Processes a chapter by running F5-TTS on GPU and Kokoro on CPU simultaneously,
     featuring an interactive chunk progress bar, emotion/tone modulation, and
@@ -867,21 +1039,36 @@ def process_hybrid_chapter_simultaneous(txt_filename, characters_map, master_out
         else:
             safe_print(msg)
 
+    chunk_overrides = load_chunk_overrides(chapter_output_dir)
+
     # 1. Pre-scan all chunks and route
     for i, chunk in enumerate(chunks):
         chunk_idx = i + 1
         chunk_filename = os.path.join(chapter_output_dir, f"chunk_{chunk_idx:03d}.wav")
         c_type = chunk["type"]
-        char_name = chunk["character"]
-        emotion = chunk.get("emotion", "") if enable_emotions else ""
+        override = chunk_overrides.get(str(chunk_idx), {})
+        char_name = override.get("character", chunk["character"])
+
+        if "variant" in override:
+            emotion = override["variant"]
+            force_variant = True
+        else:
+            emotion = chunk.get("emotion", "")
+            force_variant = False
+
         canonical_char = tag_mappings.get(char_name.lower(), char_name.lower()) if tag_mappings else char_name.lower()
         base_char_cfg = characters_map.get(canonical_char, characters_map.get("narrator", {}))
-        char_cfg = resolve_character_emotion_config(base_char_cfg, emotion, enable_emotions=enable_emotions)
+        char_cfg = resolve_character_emotion_config(
+            base_char_cfg,
+            emotion,
+            enable_emotions=enable_emotions,
+            force_variant=force_variant,
+        )
 
         engine = char_cfg.get("engine", "kokoro").lower()
         pitch_factor = float(char_cfg.get("pitch", 1.0))
         speed_factor = float(char_cfg.get("speed", 1.0))
-        volume_scale = float(char_cfg.get("volume", 1.0))
+        volume_scale = float(override["volume"]) if "volume" in override else float(char_cfg.get("volume", 1.0))
         is_f5_engine = engine in ["f5tts", "f5-tts"]
         apply_warmth = bool(char_cfg.get("warmth", is_f5_engine))
         display_name = char_cfg.get("display_name", canonical_char.title())
@@ -892,20 +1079,33 @@ def process_hybrid_chapter_simultaneous(txt_filename, characters_map, master_out
         elif engine in ["f5tts", "f5-tts"]:
             ref_audio_name = os.path.basename(char_cfg.get("ref_audio", "sample.wav"))
             act_emo = char_cfg.get("active_emotion", "")
+            act_kind = char_cfg.get("active_variant_kind", "")
             if act_emo:
-                voice_label = f"f5tts [{act_emo}: {ref_audio_name}]"
+                if act_kind == "alt":
+                    voice_label = f"f5tts [alt: {act_emo} -> {ref_audio_name}]"
+                else:
+                    voice_label = f"f5tts [{act_emo}: {ref_audio_name}]"
             else:
                 voice_label = f"f5tts [ref: {ref_audio_name}]"
+            if abs(volume_scale - 1.0) > 1e-3:
+                voice_label += f" (vol: {volume_scale:.2f}x)"
             engine_label = "F5-TTS (GPU)"
         else:
             kokoro_voice = char_cfg.get("voice", "af_bella")
+            act_emo = char_cfg.get("active_emotion", "")
+            act_kind = char_cfg.get("active_variant_kind", "")
             extras = []
-            if emotion:
+            if act_emo:
+                lbl = "alt" if act_kind == "alt" else "tone"
+                extras.append(f"{lbl}: {act_emo}")
+            elif emotion and (enable_emotions or force_variant):
                 extras.append(f"tone: {emotion}")
             if pitch_factor != 1.0:
                 extras.append(f"pitch: {pitch_factor}")
             if speed_factor != 1.0:
                 extras.append(f"speed: {speed_factor}")
+            if abs(volume_scale - 1.0) > 1e-3:
+                extras.append(f"vol: {volume_scale:.2f}x")
             if extras:
                 voice_label = f"{kokoro_voice} ({', '.join(extras)})"
             else:
@@ -996,7 +1196,7 @@ def process_hybrid_chapter_simultaneous(txt_filename, characters_map, master_out
             t0 = time.time()
             try:
                 render_kokoro_chunk_local(text, cfg, temp_raw)
-                _finalize_rendered_chunk(temp_raw, chunk_file, task)
+                _finalize_rendered_chunk(temp_raw, chunk_file, task, normalize_volume=normalize_volume)
 
                 dur = get_wav_duration(chunk_file)
                 elapsed = time.time() - t0
@@ -1043,7 +1243,7 @@ def process_hybrid_chapter_simultaneous(txt_filename, characters_map, master_out
             t0 = time.time()
             try:
                 render_f5tts_chunk_local(text, cfg, temp_raw, chapter_output_dir, idx)
-                _finalize_rendered_chunk(temp_raw, chunk_file, task)
+                _finalize_rendered_chunk(temp_raw, chunk_file, task, normalize_volume=normalize_volume)
 
                 dur = get_wav_duration(chunk_file)
                 elapsed = time.time() - t0
@@ -1253,7 +1453,357 @@ def clear_chapter_recording(master_output_dir, base_name):
         except Exception: pass
 
 
-def convert_audiobook(manifest_file=MANIFEST_FILE, enable_emotions=None, interactive=True):
+def save_characters_volume_update(char_key, new_volume, variant_name=None, characters_file=CHARACTERS_FILE):
+    """Updates volume setting for a character or specific emotion/alt entry in characters.json."""
+    ensure_characters_file()
+    with open(characters_file, "r", encoding="utf-8") as f:
+        raw_chars = json.load(f)
+
+    matched_key = next((k for k in raw_chars if k.lower() == char_key.lower()), None)
+    if not matched_key or not isinstance(raw_chars[matched_key], dict):
+        return False
+
+    if not variant_name:
+        raw_chars[matched_key]["volume"] = float(new_volume)
+    else:
+        updated = False
+        for section in ("emotions", "alts", "alt_voices", "alt"):
+            sec_map = raw_chars[matched_key].get(section)
+            if isinstance(sec_map, dict):
+                v_key = next((vk for vk in sec_map if vk.lower() == variant_name.lower()), None)
+                if v_key is not None:
+                    if isinstance(sec_map[v_key], dict):
+                        sec_map[v_key]["volume"] = float(new_volume)
+                    elif isinstance(sec_map[v_key], str):
+                        eng = str(raw_chars[matched_key].get("engine", "kokoro")).lower()
+                        field = "ref_audio" if eng in ("f5tts", "f5-tts") or "." in sec_map[v_key] else "voice"
+                        sec_map[v_key] = {field: sec_map[v_key], "volume": float(new_volume)}
+                    updated = True
+                    break
+        if not updated:
+            return False
+
+    with open(characters_file, "w", encoding="utf-8") as f:
+        json.dump(raw_chars, f, indent=4)
+    return True
+
+
+def interactive_adjust_volumes(characters):
+    """Lets the user adjust character or emotion/alt volume multipliers cleanly in characters.json."""
+    char_items = list(characters.items())
+    while True:
+        safe_print("\n" + "=" * 70)
+        safe_print("                   Voice Volume Adjustment Editor")
+        safe_print("=" * 70)
+        for idx, (key, cfg) in enumerate(char_items, 1):
+            disp = cfg.get("display_name", key)
+            vol = float(cfg.get("volume", 1.0))
+            variants = get_character_variants(cfg)
+            var_str = f" | variants: {', '.join(v[0] for v in variants)}" if variants else ""
+            safe_print(f"  [{idx:2d}] {disp:<18} (volume={vol:.2f}x){var_str}")
+        safe_print("  [ 0] Done / Continue")
+
+        sel = input("\nSelect character number to adjust [0-" + str(len(char_items)) + "] (default 0): ").strip()
+        if not sel or sel == "0":
+            break
+        try:
+            c_num = int(sel)
+            if not (1 <= c_num <= len(char_items)):
+                safe_print("[-] Invalid selection.")
+                continue
+        except ValueError:
+            safe_print("[-] Invalid number.")
+            continue
+
+        c_key, c_cfg = char_items[c_num - 1]
+        disp = c_cfg.get("display_name", c_key)
+        variants = get_character_variants(c_cfg)
+
+        target_variant = None
+        if variants:
+            safe_print(f"\nWhich voice for [{disp}]?")
+            safe_print(f"  [0] Baseline ({disp}) [cur volume={float(c_cfg.get('volume', 1.0)):.2f}x]")
+            for v_i, (v_name, v_kind, v_entry) in enumerate(variants, 1):
+                v_vol = float(v_entry.get("volume", c_cfg.get("volume", 1.0))) if isinstance(v_entry, dict) else float(c_cfg.get("volume", 1.0))
+                safe_print(f"  [{v_i}] {v_name} [{v_kind}] (cur volume={v_vol:.2f}x)")
+            v_sel = input(f"Select [0-{len(variants)}] (default 0): ").strip()
+            if v_sel and v_sel != "0":
+                try:
+                    vi = int(v_sel)
+                    if 1 <= vi <= len(variants):
+                        target_variant = variants[vi - 1][0]
+                except ValueError:
+                    pass
+
+        vol_in = input("Enter new volume multiplier (e.g. 1.0 normal, 1.25 louder, 0.8 quieter): ").strip()
+        try:
+            new_vol = float(vol_in)
+            if new_vol <= 0:
+                safe_print("[-] Volume must be positive.")
+                continue
+        except ValueError:
+            safe_print("[-] Invalid number.")
+            continue
+
+        if save_characters_volume_update(c_key, new_vol, variant_name=target_variant):
+            label = f"{disp}:{target_variant}" if target_variant else disp
+            safe_print(f"[OK] Saved volume={new_vol:.2f}x for [{label}] in '{CHARACTERS_FILE}'.")
+            characters = load_characters()
+            char_items = list(characters.items())
+        else:
+            safe_print("[!] Could not update character entry.")
+
+    return characters
+
+
+def _prompt_pick_character_and_variant(characters_map):
+    """Interactive picker for choosing a character and optional emotion/alt variant."""
+    char_items = list(characters_map.items())
+    safe_print("\nAvailable Characters:")
+    for idx, (c_key, cfg) in enumerate(char_items, 1):
+        disp = cfg.get("display_name", c_key)
+        eng = cfg.get("engine", "kokoro").upper()
+        variants = get_character_variants(cfg)
+        v_note = f" (variants: {', '.join(v[0] for v in variants)})" if variants else ""
+        safe_print(f"  [{idx:2d}] {disp:<16} [{eng}]{v_note}")
+
+    sel = input(f"Select character [1-{len(char_items)}]: ").strip()
+    try:
+        ci = int(sel)
+        if not (1 <= ci <= len(char_items)):
+            return None, None
+    except ValueError:
+        return None, None
+
+    c_key, cfg = char_items[ci - 1]
+    disp = cfg.get("display_name", c_key)
+    variants = get_character_variants(cfg)
+    chosen_variant = ""
+    if variants:
+        safe_print(f"\nSelect voice variant for [{disp}]:")
+        safe_print("  [0] Baseline / Default")
+        for v_i, (v_name, v_kind, _) in enumerate(variants, 1):
+            safe_print(f"  [{v_i}] {v_name} [{v_kind}]")
+        v_sel = input(f"Select variant [0-{len(variants)}] (default 0): ").strip()
+        if v_sel and v_sel != "0":
+            try:
+                vi = int(v_sel)
+                if 1 <= vi <= len(variants):
+                    chosen_variant = variants[vi - 1][0]
+            except ValueError:
+                pass
+
+    return c_key, chosen_variant
+
+
+def _prompt_pick_same_char_variant(char_key, characters_map, tag_mappings):
+    """Interactive picker for switching to an emotion/alt voice of the same character."""
+    canon = tag_mappings.get(char_key.lower(), char_key.lower()) if tag_mappings else char_key.lower()
+    cfg = characters_map.get(canon, characters_map.get("narrator", {}))
+    disp = cfg.get("display_name", canon)
+    variants = get_character_variants(cfg)
+    if not variants:
+        safe_print(f"  [!] No emotion or alt voices configured for [{disp}]. Using Baseline.")
+        return ""
+
+    safe_print(f"\nAvailable emotion / alt voices for [{disp}]:")
+    safe_print("  [0] Baseline / Default")
+    for v_i, (v_name, v_kind, v_entry) in enumerate(variants, 1):
+        clip = ""
+        if isinstance(v_entry, dict):
+            clip = v_entry.get("ref_audio") or v_entry.get("voice") or ""
+        elif isinstance(v_entry, str):
+            clip = v_entry
+        clip_lbl = f" ({os.path.basename(clip)})" if clip else ""
+        safe_print(f"  [{v_i}] {v_name} [{v_kind}]{clip_lbl}")
+
+    v_sel = input(f"Select voice [0-{len(variants)}] (default 0): ").strip()
+    if not v_sel or v_sel == "0":
+        return ""
+    try:
+        vi = int(v_sel)
+        if 1 <= vi <= len(variants):
+            return variants[vi - 1][0]
+    except ValueError:
+        pass
+    return ""
+
+
+def interactive_rerecord_chunks(scan_results, master_output_dir, characters_map, tag_mappings=None, enable_emotions=True):
+    """
+    Interactive chunk-level re-recording & voice switcher:
+    Allows selecting specific chunks inside a section, changing their voice to another
+    character or to one of the same character's emotion/alt voices, and adjusting chunk volume.
+    """
+    while True:
+        if len(scan_results) == 1:
+            sec_num = 1
+        else:
+            safe_print("\nSections:")
+            for item in scan_results:
+                safe_print(f"  [{item['idx']:02d}] {item['base_name']:<40} -> [{item['status']}]")
+            sec_in = input(f"\nEnter section number to edit chunks [1-{len(scan_results)}] (or Enter to finish): ").strip()
+            if not sec_in:
+                break
+            try:
+                sec_num = int(sec_in)
+                if not (1 <= sec_num <= len(scan_results)):
+                    safe_print("[-] Invalid section number.")
+                    continue
+            except ValueError:
+                safe_print("[-] Invalid number.")
+                continue
+
+        item = scan_results[sec_num - 1]
+        txt_file = item["txt_file"]
+        base_name = item["base_name"]
+        if not os.path.exists(txt_file):
+            safe_print(f"[!] Could not find text file '{txt_file}'.")
+            break
+
+        with open(txt_file, "r", encoding="utf-8") as f:
+            raw_text = f.read()
+
+        blocks = split_text_into_tagged_blocks(
+            raw_text,
+            default_character="narrator",
+            characters_map=characters_map,
+            tag_mappings=tag_mappings,
+            enable_emotions=enable_emotions,
+        )
+        chunk_dir = os.path.join(master_output_dir, "chunks_" + base_name)
+        overrides = load_chunk_overrides(chunk_dir)
+
+        safe_print("\n" + "=" * 72)
+        safe_print(f" Chunks in '{base_name}' ({len(blocks)} chunks):")
+        safe_print("=" * 72)
+        effective_info = {}
+        for idx_b, b in enumerate(blocks, 1):
+            ov = overrides.get(str(idx_b), {})
+            eff_char = ov.get("character", b["character"])
+            eff_var = ov.get("variant", b.get("emotion", ""))
+            eff_vol = ov.get("volume", None)
+            effective_info[idx_b] = (b["type"], eff_char, eff_var)
+
+            if b["type"] == "DIVIDER":
+                safe_print(f"  [{idx_b:03d}] [DIVIDER]                  | (2s Silence Pause)")
+            else:
+                tag_lbl = f"{eff_char}:{eff_var}" if eff_var else eff_char
+                if ov:
+                    tag_lbl += "*"
+                if eff_vol is not None:
+                    tag_lbl += f" vol={eff_vol:.2f}x"
+                preview = b["text"].replace("\n", " ").strip()
+                if len(preview) > 52:
+                    preview = preview[:52] + "..."
+                safe_print(f"  [{idx_b:03d}] [{tag_lbl:<24}] | {preview}")
+        safe_print("=" * 72)
+
+        ch_in = input("Enter chunk number(s) to re-record (e.g. '2', '2, 5-7', 'all', or Enter to cancel): ").strip()
+        if not ch_in:
+            if len(scan_results) == 1:
+                break
+            continue
+
+        if ch_in.lower() == "all":
+            sel_indices = list(range(1, len(blocks) + 1))
+        else:
+            sel_indices = parse_selection_indices(ch_in, len(blocks))
+
+        voice_indices = [ci for ci in sel_indices if effective_info[ci][0] != "DIVIDER"]
+        if not voice_indices:
+            safe_print("[-] No voice chunks selected.")
+            if len(scan_results) == 1:
+                break
+            continue
+
+        safe_print(f"\nSelected chunk(s): {', '.join(f'{c:03d}' for c in voice_indices)}")
+        safe_print("Voice / Re-record Action:")
+        safe_print("  [1] Re-record with current voice (no voice change) [Default]")
+        safe_print("  [2] Change to an emotion / alt voice of the SAME character")
+        safe_print("  [3] Switch chunk(s) to ANOTHER character (and optionally their emotion / alt voice)")
+        safe_print("  [4] Adjust volume multiplier only for these chunk(s)")
+        safe_print("  [5] Reset chunk(s) to original script tag & default volume")
+        act = input("Select action [1, 2, 3, 4, or 5] (default 1): ").strip() or "1"
+
+        def _prompt_optional_volume(required=False):
+            prompt = (
+                "Enter volume multiplier (e.g. 1.25 louder, 0.8 quieter): "
+                if required
+                else "Optional volume multiplier for these chunk(s) (e.g. 1.2, 0.8, Enter to keep): "
+            )
+            v_str = input(prompt).strip()
+            if not v_str:
+                return None
+            try:
+                parsed_v = float(v_str)
+                if parsed_v > 0:
+                    return parsed_v
+                safe_print("[!] Volume must be positive; ignored.")
+            except ValueError:
+                safe_print("[!] Invalid volume ignored.")
+            return None
+
+        if act == "1":
+            apply_chunk_override_action(txt_file, master_output_dir, voice_indices)
+        elif act == "2":
+            by_char = {}
+            for ci in voice_indices:
+                by_char.setdefault(effective_info[ci][1], []).append(ci)
+            chosen_pairs = []
+            for c_name, c_list in by_char.items():
+                chosen_var = _prompt_pick_same_char_variant(c_name, characters_map, tag_mappings)
+                chosen_pairs.append((c_list, chosen_var))
+            new_vol = _prompt_optional_volume(required=False)
+            for c_list, chosen_var in chosen_pairs:
+                apply_chunk_override_action(
+                    txt_file,
+                    master_output_dir,
+                    c_list,
+                    new_variant=chosen_var,
+                    set_variant=True,
+                    new_volume=new_vol,
+                )
+        elif act == "3":
+            target_char, target_var = _prompt_pick_character_and_variant(characters_map)
+            if target_char is None:
+                safe_print("[-] Cancelled character switch.")
+                if len(scan_results) == 1:
+                    break
+                continue
+            new_vol = _prompt_optional_volume(required=False)
+            apply_chunk_override_action(
+                txt_file,
+                master_output_dir,
+                voice_indices,
+                new_char=target_char,
+                new_variant=target_var,
+                set_variant=True,
+                new_volume=new_vol,
+            )
+        elif act == "4":
+            new_vol = _prompt_optional_volume(required=True)
+            if new_vol is None:
+                safe_print("[-] No valid volume entered; cancelled.")
+                if len(scan_results) == 1:
+                    break
+                continue
+            apply_chunk_override_action(txt_file, master_output_dir, voice_indices, new_volume=new_vol)
+        elif act == "5":
+            apply_chunk_override_action(txt_file, master_output_dir, voice_indices, clear_override=True)
+        else:
+            safe_print("[-] Invalid action; cancelled.")
+            if len(scan_results) == 1:
+                break
+            continue
+
+        safe_print(f"[OK] Scheduled {len(voice_indices)} chunk(s) in '{base_name}' for re-recording.")
+        again = input("\nSelect more chunks to re-record/edit? [y/N] (default n): ").strip().lower()
+        if again != "y":
+            break
+
+
+def convert_audiobook(manifest_file=MANIFEST_FILE, enable_emotions=None, interactive=True, normalize_volume=True, force_rerecord_menu=False):
     """
     Renders an audiobook from a chapter manifest using simultaneous CPU Kokoro and GPU F5-TTS.
     Returns True on success, False on error.
@@ -1289,10 +1839,29 @@ def convert_audiobook(manifest_file=MANIFEST_FILE, enable_emotions=None, interac
     for name, cfg in characters.items():
         disp_name = cfg.get("display_name", name)
         engine = cfg.get("engine", "kokoro").upper()
+        vol = float(cfg.get("volume", 1.0))
+        vol_str = f" [vol: {vol:.2f}x]" if abs(vol - 1.0) > 1e-3 else ""
+        variants = get_character_variants(cfg)
+        var_str = f" (variants: {', '.join(v[0] for v in variants)})" if variants else ""
         if engine == "KOKORO":
-            safe_print(f"  - [{disp_name}]: KOKORO (CPU) -> {cfg.get('voice', '')}")
+            safe_print(f"  - [{disp_name}]: KOKORO (CPU) -> {cfg.get('voice', '')}{vol_str}{var_str}")
         else:
-            safe_print(f"  - [{disp_name}]: F5-TTS (GPU) -> {cfg.get('ref_audio', '')}")
+            safe_print(f"  - [{disp_name}]: F5-TTS (GPU) -> {cfg.get('ref_audio', '')}{vol_str}{var_str}")
+
+    if interactive:
+        safe_print("\nVoice Volume Options:")
+        safe_print("  [1] Auto-balanced (recommended, uses per-voice 'volume' multipliers) [Default]")
+        safe_print("  [2] Unbalanced / Raw volumes (only applies explicit 'volume' multipliers)")
+        safe_print("  [3] Adjust voice volume(s) now in characters.json")
+        vol_choice = input("Select option [1, 2, or 3] (default 1): ").strip()
+        if vol_choice == "3":
+            characters = interactive_adjust_volumes(characters)
+            safe_print("  [1] Auto-balanced [Default]  |  [2] Unbalanced / Raw")
+            bal_ans = input("Use auto-balancing on render? [1 or 2] (default 1): ").strip()
+            normalize_volume = (bal_ans != "2")
+        elif vol_choice == "2":
+            normalize_volume = False
+        safe_print(f"[*] Volume Mode: {'Auto-Balanced' if normalize_volume else 'Raw (Per-Voice Multipliers Only)'}")
 
     if tag_mappings:
         safe_print(f"\nLoaded {len(tag_mappings)} tag/alias mapping(s) from '{TAG_MAPPINGS_FILE}':")
@@ -1344,7 +1913,7 @@ def convert_audiobook(manifest_file=MANIFEST_FILE, enable_emotions=None, interac
             "status": status,
         })
 
-    if has_existing and interactive:
+    if (has_existing or force_rerecord_menu) and interactive:
         safe_print("\n" + "=" * 70)
         safe_print("                 Existing Audio Sections Detected")
         safe_print("=" * 70)
@@ -1354,8 +1923,12 @@ def convert_audiobook(manifest_file=MANIFEST_FILE, enable_emotions=None, interac
         safe_print("Options:")
         safe_print("  [1] Resume / Keep existing (skip completed, finish partials) [Default]")
         safe_print("  [2] Re-record EVERYTHING from scratch")
-        safe_print("  [3] Choose specific sections to re-record")
-        choice = input("\nSelect how to proceed [1, 2, or 3] (default 1): ").strip()
+        safe_print("  [3] Choose specific sections to re-record completely")
+        safe_print("  [4] Choose specific CHUNKS to re-record / change chunk voice")
+        if force_rerecord_menu:
+            choice = "4"
+        else:
+            choice = input("\nSelect how to proceed [1, 2, 3, or 4] (default 1): ").strip()
 
         if choice == "2":
             safe_print("\n[*] Clearing ALL previous recordings. Re-recording entire book from scratch...")
@@ -1382,13 +1955,21 @@ def convert_audiobook(manifest_file=MANIFEST_FILE, enable_emotions=None, interac
                 safe_print("[*] All other completed sections will be kept and skipped automatically.\n")
             else:
                 safe_print("[-] No valid sections entered. Resuming standard progress.")
+        elif choice == "4":
+            interactive_rerecord_chunks(
+                scan_results,
+                master_output_dir,
+                characters,
+                tag_mappings=tag_mappings,
+                enable_emotions=enable_emotions,
+            )
     elif has_existing and not interactive:
         safe_print("\n[*] Existing audio sections detected. Resuming automatically (skipping completed).")
 
     # ==================== MAIN PROCESSING LOOP ====================
     for idx, txt_file in enumerate(chapter_files, 1):
         safe_print(f"\n[{idx}/{len(chapter_files)}] Processing chapter: {txt_file}")
-        success = process_hybrid_chapter_simultaneous(txt_file, characters, master_output_dir, tag_mappings=tag_mappings, enable_emotions=enable_emotions)
+        success = process_hybrid_chapter_simultaneous(txt_file, characters, master_output_dir, tag_mappings=tag_mappings, enable_emotions=enable_emotions, normalize_volume=normalize_volume)
         if not success:
             safe_print(f"[!] Pausing due to error in {txt_file}.")
             return False
@@ -1435,11 +2016,19 @@ def main():
     import argparse
     parser = argparse.ArgumentParser(description="Simultaneous Hybrid Audiobook Generator (CPU Kokoro + GPU F5)")
     parser.add_argument("--manifest", default=MANIFEST_FILE, help="Path to manifest file listing chapters (default: chapters.txt).")
-    parser.add_argument("--emotions", dest="enable_emotions", action="store_true", default=None, help="Enable dialogue tone/emotion effects (speed & pitch modulation).")
-    parser.add_argument("--no-emotions", dest="enable_emotions", action="store_false", help="Disable dialogue tone/emotion effects (pure clean baseline voices).")
+    parser.add_argument("--emotions", dest="enable_emotions", action="store_true", default=None, help="Enable dialogue emotion/alt voice routing.")
+    parser.add_argument("--no-emotions", dest="enable_emotions", action="store_false", help="Disable acoustic emotion routing (alt voices still apply).")
+    parser.add_argument("--no-volume-balance", dest="normalize_volume", action="store_false", default=True, help="Disable automatic active-speech loudness balancing.")
+    parser.add_argument("--rerecord", action="store_true", default=False, help="Jump directly to chunk-level re-record / voice switching when existing audio is found.")
     args, _ = parser.parse_known_args()
 
-    convert_audiobook(manifest_file=args.manifest, enable_emotions=args.enable_emotions, interactive=True)
+    convert_audiobook(
+        manifest_file=args.manifest,
+        enable_emotions=args.enable_emotions,
+        interactive=True,
+        normalize_volume=args.normalize_volume,
+        force_rerecord_menu=args.rerecord,
+    )
 
 
 if __name__ == "__main__":
