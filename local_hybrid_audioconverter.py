@@ -4,6 +4,7 @@ import sys
 import time
 import json
 import queue
+import subprocess
 import shutil
 import zipfile
 import threading
@@ -188,6 +189,103 @@ def apply_pitch_shift(input_path, output_path, pitch_factor):
         f'"{output_path}"'
     )
     os.system(cmd)
+
+
+def normalize_chunk_volume(wav_path, emotion="", volume_scale=1.0, max_peak=0.88):
+    """
+    Balances active-speech loudness across Kokoro and F5-TTS chunks so characters
+    and emotions sit smoothly at consistent volume without clipping.
+    Measures active non-silent frames so long pauses do not skew gain.
+    """
+    try:
+        data, sr = sf.read(wav_path)
+    except Exception:
+        return
+    if data.size == 0:
+        return
+
+    mono = data.mean(axis=1) if data.ndim > 1 else data
+    win = max(1, int(0.05 * sr))
+    n_frames = len(mono) // win
+    if n_frames > 0:
+        frames = mono[: n_frames * win].reshape(n_frames, win)
+        frame_rms = np.sqrt(np.mean(frames ** 2, axis=1))
+        thresh = max(0.005, 0.15 * float(np.max(frame_rms)))
+        active = frame_rms[frame_rms >= thresh]
+        cur_rms = float(np.sqrt(np.mean(active ** 2))) if len(active) > 0 else float(np.sqrt(np.mean(mono ** 2)))
+    else:
+        cur_rms = float(np.sqrt(np.mean(mono ** 2)))
+
+    if cur_rms < 1e-4:
+        return
+
+    emo = (emotion or "").strip().lower()
+    if emo in ("whisper", "whispering"):
+        target_rms = 0.052
+    elif emo in ("shout", "shouting", "screaming", "yelling"):
+        target_rms = 0.092
+    else:
+        target_rms = 0.075
+
+    target_rms *= float(volume_scale)
+    gain = max(0.35, min(3.0, target_rms / cur_rms))
+
+    scaled = data * gain
+    peak = float(np.max(np.abs(scaled)))
+    if peak > max_peak:
+        scaled = scaled * (max_peak / peak)
+
+    sf.write(wav_path, scaled, sr)
+
+
+WARMTH_EQ_FILTER = (
+    "highpass=f=65,"
+    "equalizer=f=175:t=q:w=0.9:g=3.5,"
+    "equalizer=f=3100:t=q:w=1.0:g=-3.0,"
+    "treble=g=-3.5:f=5500,"
+    "lowpass=f=9800"
+)
+
+
+def apply_warm_eq(wav_path):
+    """
+    Applies a subtle studio warmth curve to remove thin/tinny F5-TTS Vocos resonance
+    on headphones (adds chest body at 175 Hz, tames harsh 3.1 kHz & >5.5 kHz metallic hiss).
+    """
+    temp_eq = wav_path + ".eq.wav"
+    cmd = ["ffmpeg", "-y", "-loglevel", "error", "-i", wav_path, "-af", WARMTH_EQ_FILTER, temp_eq]
+    try:
+        res = subprocess.run(cmd, capture_output=True)
+        if res.returncode == 0 and os.path.exists(temp_eq) and os.path.getsize(temp_eq) > 0:
+            os.replace(temp_eq, wav_path)
+    except Exception:
+        pass
+    finally:
+        if os.path.exists(temp_eq):
+            try:
+                os.remove(temp_eq)
+            except Exception:
+                pass
+
+
+def _finalize_rendered_chunk(temp_raw, chunk_file, task):
+    """Applies optional pitch shift, studio warmth EQ (for F5-TTS), and volume balancing."""
+    pitch = task["pitch_factor"]
+    if pitch != 1.0:
+        apply_pitch_shift(temp_raw, chunk_file, pitch)
+        if os.path.exists(temp_raw):
+            os.remove(temp_raw)
+    else:
+        os.replace(temp_raw, chunk_file)
+
+    if task.get("apply_warmth", False):
+        apply_warm_eq(chunk_file)
+
+    normalize_chunk_volume(
+        chunk_file,
+        emotion=task.get("emotion", ""),
+        volume_scale=task.get("volume_scale", 1.0),
+    )
 
 
 def get_wav_duration(wav_path):
@@ -625,14 +723,31 @@ def render_kokoro_chunk_local(text, char_cfg, output_wav):
     sf.write(output_wav, audio_np, 24000)
 
 
+def _sanitize_f5_punctuation(text):
+    """Normalizes exclamation punctuation to prevent F5-TTS exclamation screaming distortion."""
+    if not text:
+        return text
+    # Convert !? / ?! to ?, and ! to ., then collapse accidental duplicates
+    cleaned = re.sub(r"(?:!\?|\?!)+", "?", text)
+    cleaned = re.sub(r"!+", ".", cleaned)
+    cleaned = re.sub(r"(?<!\.)\.\.(?!\.)", ".", cleaned)
+    return re.sub(r"([?!])\.+", r"\1", cleaned).strip()
+
+
 def render_f5tts_chunk_local(text, char_cfg, output_wav, temp_dir, chunk_index):
-    """Renders a text chunk using local GPU F5-TTS with sentence chunking & stitching."""
+    """Renders a text chunk using local GPU F5-TTS with clean punctuation & peak protection."""
     f5 = get_f5tts_engine()
 
     ref_audio = char_cfg.get("ref_audio", "ref_sample.wav")
-    ref_text = char_cfg.get("ref_text", "")
+    ref_text = _sanitize_f5_punctuation(char_cfg.get("ref_text", ""))
     speed = float(char_cfg.get("speed", 1.0))
-    steps = int(char_cfg.get("steps", 16))
+    steps = int(char_cfg.get("steps", 32))
+    active_emotion = str(char_cfg.get("active_emotion", "")).lower()
+
+    # Lower CFG and target RMS slightly on intense emotions to prevent vocoder crunch on shouted/raspy refs
+    is_intense = active_emotion in ("shout", "shouting", "screaming", "yelling", "angry")
+    cfg_strength = float(char_cfg.get("cfg_strength", 1.3 if is_intense else 1.8))
+    target_rms = float(char_cfg.get("target_rms", 0.08 if is_intense else 0.1))
 
     if not os.path.exists(ref_audio):
         raise FileNotFoundError(f"F5-TTS reference audio '{ref_audio}' does not exist.")
@@ -645,47 +760,40 @@ def render_f5tts_chunk_local(text, char_cfg, output_wav, temp_dir, chunk_index):
     except Exception:
         pass
 
-    sentences = split_sentences(text, max_len=MAX_CHARS_PER_F5_CHUNK)
+    sentences = [s.strip() for s in split_sentences(text, max_len=MAX_CHARS_PER_F5_CHUNK) if s.strip()]
+    audio_segments = []
+    target_sr = 24000
+    pause = np.zeros(int(0.18 * target_sr), dtype=np.float32)
 
-    if len(sentences) == 1:
+    for sentence in sentences:
+        clean_sentence = _sanitize_f5_punctuation(sentence)
+        if not clean_sentence:
+            continue
         wav, sr, _ = f5.infer(
             ref_file=ref_audio,
             ref_text=ref_text,
-            gen_text=sentences[0],
-            file_wave=output_wav,
+            gen_text=clean_sentence,
+            file_wave=None,
             speed=speed,
             nfe_step=steps,
+            cfg_strength=cfg_strength,
+            target_rms=target_rms,
             show_info=lambda *args, **kwargs: None,
             progress=None
         )
-        if not os.path.exists(output_wav):
-            sf.write(output_wav, wav, sr)
-    else:
-        audio_segments = []
-        target_sr = 24000
-        pause_samples = int(0.18 * target_sr)
-        pause = np.zeros(pause_samples, dtype=np.float32)
+        target_sr = sr
+        if audio_segments:
+            audio_segments.append(pause)
+        audio_segments.append(wav)
 
-        for s_idx, sentence in enumerate(sentences):
-            sentence = sentence.strip()
-            if not sentence:
-                continue
-            wav, sr, _ = f5.infer(
-                ref_file=ref_audio,
-                ref_text=ref_text,
-                gen_text=sentence,
-                speed=speed,
-                nfe_step=steps,
-                show_info=lambda *args, **kwargs: None,
-                progress=None
-            )
-            target_sr = sr
-            if audio_segments:
-                audio_segments.append(pause)
-            audio_segments.append(wav)
+    full_wav = np.concatenate(audio_segments) if audio_segments else np.zeros(target_sr, dtype=np.float32)
 
-        full_wav = np.concatenate(audio_segments) if audio_segments else np.zeros(target_sr, dtype=np.float32)
-        sf.write(output_wav, full_wav, target_sr)
+    # Prevent PCM clipping distortion when loud reference clips overshoot 1.0
+    peak = float(np.max(np.abs(full_wav))) if len(full_wav) else 0.0
+    if peak > 0.88:
+        full_wav = full_wav * (0.88 / peak)
+
+    sf.write(output_wav, full_wav, target_sr)
 
 
 # ==================== PARALLEL CHAPTER PROCESSING ====================
@@ -773,6 +881,9 @@ def process_hybrid_chapter_simultaneous(txt_filename, characters_map, master_out
         engine = char_cfg.get("engine", "kokoro").lower()
         pitch_factor = float(char_cfg.get("pitch", 1.0))
         speed_factor = float(char_cfg.get("speed", 1.0))
+        volume_scale = float(char_cfg.get("volume", 1.0))
+        is_f5_engine = engine in ["f5tts", "f5-tts"]
+        apply_warmth = bool(char_cfg.get("warmth", is_f5_engine))
         display_name = char_cfg.get("display_name", canonical_char.title())
 
         if c_type == "DIVIDER":
@@ -812,6 +923,8 @@ def process_hybrid_chapter_simultaneous(txt_filename, characters_map, master_out
             "engine_label": engine_label,
             "voice_label": voice_label,
             "pitch_factor": pitch_factor,
+            "volume_scale": volume_scale,
+            "apply_warmth": apply_warmth,
             "chunk_filename": chunk_filename,
             "text": chunk.get("text", "")
         }
@@ -883,12 +996,7 @@ def process_hybrid_chapter_simultaneous(txt_filename, characters_map, master_out
             t0 = time.time()
             try:
                 render_kokoro_chunk_local(text, cfg, temp_raw)
-                if pitch != 1.0:
-                    apply_pitch_shift(temp_raw, chunk_file, pitch)
-                    if os.path.exists(temp_raw):
-                        os.remove(temp_raw)
-                else:
-                    os.replace(temp_raw, chunk_file)
+                _finalize_rendered_chunk(temp_raw, chunk_file, task)
 
                 dur = get_wav_duration(chunk_file)
                 elapsed = time.time() - t0
@@ -935,12 +1043,7 @@ def process_hybrid_chapter_simultaneous(txt_filename, characters_map, master_out
             t0 = time.time()
             try:
                 render_f5tts_chunk_local(text, cfg, temp_raw, chapter_output_dir, idx)
-                if pitch != 1.0:
-                    apply_pitch_shift(temp_raw, chunk_file, pitch)
-                    if os.path.exists(temp_raw):
-                        os.remove(temp_raw)
-                else:
-                    os.replace(temp_raw, chunk_file)
+                _finalize_rendered_chunk(temp_raw, chunk_file, task)
 
                 dur = get_wav_duration(chunk_file)
                 elapsed = time.time() - t0
@@ -1031,8 +1134,8 @@ def process_hybrid_chapter_simultaneous(txt_filename, characters_map, master_out
 
     safe_print(f"    [*] Merging {len(saved_files)} chunks into '{final_mp3}'...")
     cmd = (
-        f'ffmpeg -y -f concat -safe 0 -i "{list_file}" -codec:a libmp3lame'
-        f' -qscale:a 2 "{final_mp3}"'
+        f'ffmpeg -y -f concat -safe 0 -i "{list_file}" -ar 44100 -codec:a libmp3lame'
+        f' -b:a 192k "{final_mp3}"'
     )
 
     if os.system(cmd) == 0:
