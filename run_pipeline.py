@@ -178,6 +178,11 @@ def run_full_pipeline(
     interactive: bool = False,
     normalize_volume: bool = True,
     force_rerecord_menu: bool = False,
+    random_narrator: bool = False,
+    narrator_gender: str = "any",
+    narrator_accent: str = "any",
+    narrator_voices: str = "2-4",
+    save_random_narrator: bool = False,
 ):
     """
     Executes all stages of the audiobook generator:
@@ -258,6 +263,11 @@ def run_full_pipeline(
         interactive=interactive,
         normalize_volume=normalize_volume,
         force_rerecord_menu=force_rerecord_menu,
+        random_narrator=random_narrator,
+        narrator_gender=narrator_gender,
+        narrator_accent=narrator_accent,
+        narrator_voices=narrator_voices,
+        save_random_narrator=save_random_narrator,
     )
 
     if success:
@@ -344,8 +354,41 @@ def main():
         default=False,
         help="Open chunk-level re-record / voice switching menu before rendering audio.",
     )
+    parser.add_argument(
+        "--random-narrator",
+        action="store_true",
+        default=False,
+        help="Randomize the narrator voice using random Kokoro TTS voices.",
+    )
+    parser.add_argument(
+        "--narrator-gender",
+        choices=["female", "male", "mostly-female", "mostly-male", "any"],
+        default=None,
+        help="Gender preference for randomized Kokoro narrator.",
+    )
+    parser.add_argument(
+        "--narrator-accent",
+        choices=["american", "british", "any"],
+        default=None,
+        help="Regional accent preference for randomized Kokoro narrator.",
+    )
+    parser.add_argument(
+        "--narrator-voices",
+        type=str,
+        default=None,
+        help="Number or range of Kokoro voices to mix (e.g. '3' or '2-4').",
+    )
+    parser.add_argument(
+        "--save-narrator",
+        action="store_true",
+        default=False,
+        help="Save randomized narrator voice into characters.json.",
+    )
 
     args = parser.parse_args()
+    use_random_narrator = args.random_narrator or any(
+        val is not None for val in (args.narrator_gender, args.narrator_accent, args.narrator_voices)
+    )
 
     source = args.source
     is_interactive = False
@@ -381,6 +424,11 @@ def main():
         interactive=is_interactive or args.rerecord,
         normalize_volume=args.normalize_volume,
         force_rerecord_menu=args.rerecord,
+        random_narrator=use_random_narrator,
+        narrator_gender=args.narrator_gender or "any",
+        narrator_accent=args.narrator_accent or "any",
+        narrator_voices=args.narrator_voices or "2-4",
+        save_random_narrator=args.save_narrator,
     )
 
 

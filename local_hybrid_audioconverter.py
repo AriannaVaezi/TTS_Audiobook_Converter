@@ -4,6 +4,7 @@ import sys
 import time
 import json
 import queue
+import random
 import subprocess
 import shutil
 import zipfile
@@ -50,6 +51,22 @@ MAX_CHARS_PER_KOKORO_CHUNK = 1200
 MAX_CHARS_PER_F5_CHUNK = 100  # Compact F5 chunk size (~1-2 sentences) for easy targeted re-recording
 MIN_CHARS_PER_F5_CHUNK = 25   # Avoid isolating tiny words ("Yes.", "No.", "Okay.") as standalone chunks
 KOKORO_REPO_ID = "hexgrad/Kokoro-82M"
+KOKORO_VOICE_CATALOG = {
+    "american": {
+        "female": [
+            "af_alloy", "af_aoede", "af_bella", "af_heart", "af_jessica",
+            "af_kore", "af_nicole", "af_nova", "af_river", "af_sarah", "af_sky",
+        ],
+        "male": [
+            "am_adam", "am_echo", "am_eric", "am_fenrir",
+            "am_liam", "am_michael", "am_onyx", "am_puck",
+        ],
+    },
+    "british": {
+        "female": ["bf_alice", "bf_emma", "bf_isabella", "bf_lily"],
+        "male": ["bm_daniel", "bm_fable", "bm_george", "bm_lewis"],
+    },
+}
 # ========================================================
 
 # Thread-safe console printing
@@ -855,6 +872,353 @@ def parse_and_load_kokoro_voice(pipeline, voice_str):
 
         VOICE_CACHE[voice_str] = voice_tensor
         return voice_tensor
+
+
+def _normalize_narrator_gender(gender):
+    """Normalizes gender option aliases into canonical keys."""
+    raw = str(gender or "any").strip().lower().replace(" ", "_").replace("-", "_")
+    mapping = {
+        "female": "female",
+        "f": "female",
+        "male": "male",
+        "m": "male",
+        "mostly_female": "mostly_female",
+        "mf": "mostly_female",
+        "mostly_male": "mostly_male",
+        "mm": "mostly_male",
+        "any": "any",
+        "none": "any",
+        "no_preference": "any",
+        "mixed": "any",
+        "all": "any",
+    }
+    if raw not in mapping:
+        raise ValueError(
+            f"Invalid narrator gender '{gender}'. Choose from: female, male, mostly-female, mostly-male, any."
+        )
+    return mapping[raw]
+
+
+def _normalize_narrator_accent(accent):
+    """Normalizes regional/accent option aliases into canonical keys."""
+    raw = str(accent or "any").strip().lower().replace(" ", "_").replace("-", "_")
+    mapping = {
+        "american": "american",
+        "us": "american",
+        "a": "american",
+        "british": "british",
+        "uk": "british",
+        "gb": "british",
+        "b": "british",
+        "any": "any",
+        "none": "any",
+        "no_preference": "any",
+        "all": "any",
+    }
+    if raw not in mapping:
+        raise ValueError(
+            f"Invalid narrator accent '{accent}'. Choose from: american, british, any."
+        )
+    return mapping[raw]
+
+
+def parse_voice_count_range(spec, max_available=None):
+    """
+    Parses a voice mix count or inclusive range such as 3, '3', '2-4', '2..5', or (2, 4).
+    Returns clamped (low, high) integer bounds.
+    """
+    if isinstance(spec, (tuple, list)) and len(spec) == 2:
+        lo, hi = int(spec[0]), int(spec[1])
+    elif isinstance(spec, int):
+        lo, hi = spec, spec
+    else:
+        text = str(spec or "2-4").strip()
+        m_single = re.match(r"^(\d+)$", text)
+        m_range = re.match(r"^(\d+)\s*(?:-|\.\.|to)\s*(\d+)$", text, re.IGNORECASE)
+        if m_single:
+            lo = hi = int(m_single.group(1))
+        elif m_range:
+            lo, hi = int(m_range.group(1)), int(m_range.group(2))
+        else:
+            raise ValueError(f"Invalid voice count or range '{spec}'. Expected e.g. '3' or '2-4'.")
+
+    if lo < 1 or hi < 1:
+        raise ValueError("Voice count must be at least 1.")
+    if lo > hi:
+        lo, hi = hi, lo
+    if max_available is not None and max_available >= 1:
+        hi = min(hi, max_available)
+        lo = min(lo, hi)
+    return lo, hi
+
+
+def get_kokoro_voice_pool(accent="any"):
+    """Returns (female_voices, male_voices) filtered by accent ('american', 'british', or 'any')."""
+    norm_accent = _normalize_narrator_accent(accent)
+    regions = ["american", "british"] if norm_accent == "any" else [norm_accent]
+    females = []
+    males = []
+    for reg in regions:
+        females.extend(KOKORO_VOICE_CATALOG[reg]["female"])
+        males.extend(KOKORO_VOICE_CATALOG[reg]["male"])
+    return females, males
+
+
+def _distribute_rounded_weights(count, total_weight, rng):
+    """Generates `count` positive 2-decimal weights summing cleanly to `total_weight`."""
+    total_cents = max(count, int(round(total_weight * 100)))
+    raw = [rng.uniform(0.35, 1.0) for _ in range(count)]
+    raw_sum = sum(raw)
+    cents = [max(1, int(round((val / raw_sum) * total_cents))) for val in raw]
+    diff = total_cents - sum(cents)
+    # Adjust the largest component so exact sum equals total_cents (keep >= 1)
+    idx_order = sorted(range(count), key=lambda i: cents[i], reverse=True)
+    step = 1 if diff > 0 else -1
+    rem = abs(diff)
+    cursor = 0
+    while rem > 0 and idx_order:
+        target_idx = idx_order[cursor % len(idx_order)]
+        if step > 0 or cents[target_idx] > 1:
+            cents[target_idx] += step
+            rem -= 1
+        cursor += 1
+        if cursor > rem + count * 10:
+            break
+    return [c / 100.0 for c in cents]
+
+
+def generate_random_kokoro_voice(gender="any", accent="any", voice_count="2-4", rng=None):
+    """
+    Generates a randomized Kokoro voice name or weighted blend string compatible with
+    parse_and_load_kokoro_voice().
+
+    Args:
+        gender: 'female', 'male', 'mostly_female' (0.2-0.4 male), 'mostly_male' (0.2-0.4 female), or 'any'.
+        accent: 'american', 'british', or 'any'.
+        voice_count: exact integer or inclusive range ('3', '2-4', (2, 5)).
+        rng: optional random.Random instance for deterministic testing.
+    """
+    r = rng if rng is not None else random
+    norm_gender = _normalize_narrator_gender(gender)
+    norm_accent = _normalize_narrator_accent(accent)
+    female_pool, male_pool = get_kokoro_voice_pool(norm_accent)
+
+    if norm_gender == "female":
+        max_avail = len(female_pool)
+        lo, hi = parse_voice_count_range(voice_count, max_available=max_avail)
+        k = r.randint(lo, hi)
+        chosen = r.sample(female_pool, k)
+        if k == 1:
+            return chosen[0]
+        weights = _distribute_rounded_weights(k, 1.0, r)
+        pairs = sorted(zip(chosen, weights), key=lambda x: x[1], reverse=True)
+    elif norm_gender == "male":
+        max_avail = len(male_pool)
+        lo, hi = parse_voice_count_range(voice_count, max_available=max_avail)
+        k = r.randint(lo, hi)
+        chosen = r.sample(male_pool, k)
+        if k == 1:
+            return chosen[0]
+        weights = _distribute_rounded_weights(k, 1.0, r)
+        pairs = sorted(zip(chosen, weights), key=lambda x: x[1], reverse=True)
+    elif norm_gender in ("mostly_female", "mostly_male"):
+        max_avail = len(female_pool) + len(male_pool)
+        lo, hi = parse_voice_count_range(voice_count, max_available=max_avail)
+        eff_lo = min(max_avail, max(2, lo))
+        eff_hi = max(eff_lo, hi)
+        k = r.randint(eff_lo, eff_hi)
+
+        maj_pool, min_pool = (female_pool, male_pool) if norm_gender == "mostly_female" else (male_pool, female_pool)
+        max_min_count = min(len(min_pool), k - 1, max(1, k // 2))
+        min_min_count = max(1, k - len(maj_pool))
+        n_min = r.randint(min_min_count, max(min_min_count, max_min_count))
+        n_maj = k - n_min
+
+        minority_total = r.randint(20, 40) / 100.0  # Strictly 0.20 - 0.40 minority gender share
+        majority_total = round(1.0 - minority_total, 2)
+
+        maj_chosen = r.sample(maj_pool, n_maj)
+        min_chosen = r.sample(min_pool, n_min)
+        maj_weights = _distribute_rounded_weights(n_maj, majority_total, r)
+        min_weights = _distribute_rounded_weights(n_min, minority_total, r)
+        pairs = sorted(zip(maj_chosen, maj_weights), key=lambda x: x[1], reverse=True) + sorted(
+            zip(min_chosen, min_weights), key=lambda x: x[1], reverse=True
+        )
+    else:
+        combined = female_pool + male_pool
+        lo, hi = parse_voice_count_range(voice_count, max_available=len(combined))
+        k = r.randint(lo, hi)
+        chosen = r.sample(combined, k)
+        if k == 1:
+            return chosen[0]
+        weights = _distribute_rounded_weights(k, 1.0, r)
+        pairs = sorted(zip(chosen, weights), key=lambda x: x[1], reverse=True)
+
+    return " + ".join(f"{name}*{w:.2f}" for name, w in pairs)
+
+
+def summarize_kokoro_blend(voice_spec):
+    """Returns a concise summary of female/male and American/British share in a Kokoro voice string."""
+    raw_parts = [p.strip() for p in re.split(r"[\+,]", str(voice_spec or "")) if p.strip()]
+    items = []
+    for part in raw_parts:
+        m = re.match(r"^([a-zA-Z0-9_]+)\s*\*\s*([0-9.]+)$", part)
+        if m:
+            items.append((m.group(1), float(m.group(2))))
+        else:
+            items.append((part, 1.0))
+    total = sum(w for _, w in items) or 1.0
+    female_w = sum(w for name, w in items if len(name) >= 2 and name[1] == "f") / total
+    male_w = sum(w for name, w in items if len(name) >= 2 and name[1] == "m") / total
+    us_w = sum(w for name, w in items if name.startswith("a")) / total
+    uk_w = sum(w for name, w in items if name.startswith("b")) / total
+    return (
+        f"{len(items)} voice(s) | "
+        f"Female {female_w * 100:.0f}% / Male {male_w * 100:.0f}% | "
+        f"American {us_w * 100:.0f}% / British {uk_w * 100:.0f}%"
+    )
+
+
+def save_narrator_voice_update(voice_spec, characters_file=CHARACTERS_FILE):
+    """Persists a Kokoro narrator voice string into characters.json while keeping narrator settings."""
+    try:
+        with open(characters_file, "r", encoding="utf-8") as f:
+            raw_chars = json.load(f)
+    except Exception:
+        raw_chars = {}
+
+    matched_key = next((k for k in raw_chars.keys() if k.lower() == "narrator"), "narrator")
+    existing = raw_chars.get(matched_key)
+    if isinstance(existing, dict):
+        updated_entry = dict(existing)
+        updated_entry.pop("alias", None)
+        updated_entry.pop("character", None)
+    else:
+        updated_entry = {}
+
+    updated_entry["engine"] = "kokoro"
+    updated_entry["voice"] = voice_spec
+    updated_entry.setdefault("pitch", 1.0)
+    updated_entry.setdefault("speed", 1.0)
+    updated_entry.setdefault("volume", 1.0)
+    raw_chars[matched_key] = updated_entry
+
+    with open(characters_file, "w", encoding="utf-8") as f:
+        json.dump(raw_chars, f, indent=4)
+    return True
+
+
+def apply_random_narrator_to_characters(
+    characters_map,
+    gender="any",
+    accent="any",
+    voice_count="2-4",
+    persist=False,
+    characters_file=CHARACTERS_FILE,
+    rng=None,
+):
+    """Generates a random Kokoro voice blend and assigns it to `narrator` in characters_map."""
+    voice_spec = generate_random_kokoro_voice(
+        gender=gender, accent=accent, voice_count=voice_count, rng=rng
+    )
+    nar = dict(characters_map.get("narrator", {}))
+    nar["display_name"] = nar.get("display_name", "narrator")
+    nar["engine"] = "kokoro"
+    nar["voice"] = voice_spec
+    nar.setdefault("pitch", 1.0)
+    nar.setdefault("speed", 1.0)
+    nar.setdefault("volume", 1.0)
+    characters_map["narrator"] = nar
+
+    if persist:
+        save_narrator_voice_update(voice_spec, characters_file=characters_file)
+    return characters_map, voice_spec
+
+
+def interactive_randomize_narrator(characters_map):
+    """Interactive prompt letting the user randomize the narrator voice with Kokoro options."""
+    cur_nar = characters_map.get("narrator", {})
+    cur_voice = cur_nar.get("voice") or cur_nar.get("ref_audio") or "af_bella"
+    safe_print(f"\nNarrator Voice Options (Currently: {cur_voice}):")
+    safe_print("  [1] Keep current narrator from characters.json [Default]")
+    safe_print("  [2] Randomize narrator with random Kokoro TTS voice blend")
+    mode_choice = input("Select option [1 or 2] (default 1): ").strip()
+    if mode_choice != "2":
+        return characters_map
+
+    gender_choices = {
+        "1": "female",
+        "2": "male",
+        "3": "mostly_female",
+        "4": "mostly_male",
+        "5": "any",
+        "": "any",
+    }
+    accent_choices = {
+        "1": "american",
+        "2": "british",
+        "3": "any",
+        "": "any",
+    }
+
+    while True:
+        safe_print("\nRandom Narrator Gender Preference:")
+        safe_print("  [1] Female only")
+        safe_print("  [2] Male only")
+        safe_print("  [3] Mostly female (0.2 - 0.4 male)")
+        safe_print("  [4] Mostly male (0.2 - 0.4 female)")
+        safe_print("  [5] No gender preference (mix any genders) [Default]")
+        g_in = input("Select gender [1-5] (default 5): ").strip()
+        gender = gender_choices.get(g_in, "any")
+
+        safe_print("\nRandom Narrator Accent / Region:")
+        safe_print("  [1] American")
+        safe_print("  [2] British")
+        safe_print("  [3] No regional preference [Default]")
+        a_in = input("Select accent [1-3] (default 3): ").strip()
+        accent = accent_choices.get(a_in, "any")
+
+        while True:
+            cnt_in = input("\nNumber of voices to mix (exact like '3' or range like '2-4', default 2-4): ").strip()
+            count_spec = cnt_in or "2-4"
+            try:
+                parse_voice_count_range(count_spec)
+                break
+            except ValueError as e:
+                safe_print(f"[-] {e}")
+
+        if gender in ("mostly_female", "mostly_male") and parse_voice_count_range(count_spec)[1] < 2:
+            safe_print(f"[*] '{gender.replace('_', ' ')}' requires blending at least 2 voices; using 2 voices.")
+
+        while True:
+            rolled = generate_random_kokoro_voice(gender=gender, accent=accent, voice_count=count_spec)
+            safe_print(f"\n[*] Rolled Kokoro Narrator: {rolled}")
+            safe_print(f"    Mix breakdown        : {summarize_kokoro_blend(rolled)}")
+            confirm = input("Action: [Enter] Use this voice | [r] Re-roll | [c] Change options / cancel: ").strip().lower()
+            if confirm == "r":
+                continue
+            if confirm == "c":
+                break
+            save_ans = input(f"Save this narrator voice to '{CHARACTERS_FILE}'? [Y/n] (default Y): ").strip().lower()
+            persist = (save_ans != "n")
+            nar = dict(characters_map.get("narrator", {}))
+            nar["display_name"] = nar.get("display_name", "narrator")
+            nar["engine"] = "kokoro"
+            nar["voice"] = rolled
+            nar.setdefault("pitch", 1.0)
+            nar.setdefault("speed", 1.0)
+            nar.setdefault("volume", 1.0)
+            characters_map["narrator"] = nar
+            if persist:
+                save_narrator_voice_update(rolled)
+                safe_print(f"[OK] Saved randomized narrator voice to '{CHARACTERS_FILE}'.")
+            else:
+                safe_print("[*] Using randomized narrator voice for this run only.")
+            return characters_map
+
+        again = input("Cancel randomizer and keep original narrator? [y/N] (default N): ").strip().lower()
+        if again == "y":
+            return characters_map
 
 
 def render_kokoro_chunk_local(text, char_cfg, output_wav):
@@ -1877,7 +2241,18 @@ def interactive_rerecord_chunks(scan_results, master_output_dir, characters_map,
             break
 
 
-def convert_audiobook(manifest_file=MANIFEST_FILE, enable_emotions=None, interactive=True, normalize_volume=True, force_rerecord_menu=False):
+def convert_audiobook(
+    manifest_file=MANIFEST_FILE,
+    enable_emotions=None,
+    interactive=True,
+    normalize_volume=True,
+    force_rerecord_menu=False,
+    random_narrator=False,
+    narrator_gender="any",
+    narrator_accent="any",
+    narrator_voices="2-4",
+    save_random_narrator=False,
+):
     """
     Renders an audiobook from a chapter manifest using simultaneous CPU Kokoro and GPU F5-TTS.
     Returns True on success, False on error.
@@ -1921,6 +2296,21 @@ def convert_audiobook(manifest_file=MANIFEST_FILE, enable_emotions=None, interac
             safe_print(f"  - [{disp_name}]: KOKORO (CPU) -> {cfg.get('voice', '')}{vol_str}{var_str}")
         else:
             safe_print(f"  - [{disp_name}]: F5-TTS (GPU) -> {cfg.get('ref_audio', '')}{vol_str}{var_str}")
+
+    if random_narrator:
+        characters, rolled_voice = apply_random_narrator_to_characters(
+            characters,
+            gender=narrator_gender or "any",
+            accent=narrator_accent or "any",
+            voice_count=narrator_voices or "2-4",
+            persist=save_random_narrator,
+        )
+        safe_print(f"\n[*] Randomized Kokoro Narrator: {rolled_voice}")
+        safe_print(f"    ({summarize_kokoro_blend(rolled_voice)})")
+        if save_random_narrator:
+            safe_print(f"[OK] Saved randomized narrator voice to '{CHARACTERS_FILE}'.")
+    elif interactive:
+        characters = interactive_randomize_narrator(characters)
 
     if interactive:
         safe_print("\nVoice Volume Options:")
@@ -2094,7 +2484,31 @@ def main():
     parser.add_argument("--no-emotions", dest="enable_emotions", action="store_false", help="Disable acoustic emotion routing (alt voices still apply).")
     parser.add_argument("--no-volume-balance", dest="normalize_volume", action="store_false", default=True, help="Disable automatic active-speech loudness balancing.")
     parser.add_argument("--rerecord", action="store_true", default=False, help="Jump directly to chunk-level re-record / voice switching when existing audio is found.")
+    parser.add_argument("--random-narrator", action="store_true", default=False, help="Randomize the narrator using random Kokoro TTS voices.")
+    parser.add_argument(
+        "--narrator-gender",
+        choices=["female", "male", "mostly-female", "mostly-male", "any"],
+        default=None,
+        help="Gender filter for randomized narrator: female, male, mostly-female (0.2-0.4 male), mostly-male (0.2-0.4 female), or any.",
+    )
+    parser.add_argument(
+        "--narrator-accent",
+        choices=["american", "british", "any"],
+        default=None,
+        help="Regional accent filter for randomized narrator: american, british, or any.",
+    )
+    parser.add_argument(
+        "--narrator-voices",
+        type=str,
+        default=None,
+        help="Number or range of Kokoro voices to mix for randomized narrator (e.g. '3' or '2-4').",
+    )
+    parser.add_argument("--save-narrator", action="store_true", default=False, help="Save randomized narrator voice into characters.json.")
     args, _ = parser.parse_known_args()
+
+    use_random_narrator = args.random_narrator or any(
+        val is not None for val in (args.narrator_gender, args.narrator_accent, args.narrator_voices)
+    )
 
     convert_audiobook(
         manifest_file=args.manifest,
@@ -2102,6 +2516,11 @@ def main():
         interactive=True,
         normalize_volume=args.normalize_volume,
         force_rerecord_menu=args.rerecord,
+        random_narrator=use_random_narrator,
+        narrator_gender=args.narrator_gender or "any",
+        narrator_accent=args.narrator_accent or "any",
+        narrator_voices=args.narrator_voices or "2-4",
+        save_random_narrator=args.save_narrator,
     )
 
 
