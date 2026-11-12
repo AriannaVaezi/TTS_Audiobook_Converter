@@ -47,7 +47,8 @@ CHARACTERS_FILE = "characters.json"
 TAG_MAPPINGS_FILE = "tag_mappings.json"
 FINISHED_DIR = "finished"
 MAX_CHARS_PER_KOKORO_CHUNK = 1200
-MAX_CHARS_PER_F5_CHUNK = 300  # F5-TTS works best with shorter sentence chunks
+MAX_CHARS_PER_F5_CHUNK = 100  # Compact F5 chunk size (~1-2 sentences) for easy targeted re-recording
+MIN_CHARS_PER_F5_CHUNK = 25   # Avoid isolating tiny words ("Yes.", "No.", "Okay.") as standalone chunks
 KOKORO_REPO_ID = "hexgrad/Kokoro-82M"
 # ========================================================
 
@@ -643,7 +644,14 @@ def split_text_into_tagged_blocks(text, default_character="narrator", characters
             "text": raw_line
         })
 
-    # Group contiguous blocks of the same character and emotion up to maximum character limits
+    def is_f5_block(char_name, emotion_name=""):
+        char_cfg = (characters_map or {}).get(char_name.lower(), {})
+        if emotion_name:
+            char_cfg = resolve_character_emotion_config(char_cfg, emotion_name, enable_emotions=enable_emotions)
+        return char_cfg.get("engine", "").lower() in ["f5tts", "f5-tts"] or "f5" in char_name.lower()
+
+    # Split F5-TTS blocks into compact (~140 char) sentence-grouped chunks while keeping short
+    # replies ("Yes.", "No.", "Okay.") grouped with adjacent lines; merge Kokoro up to 1200 chars.
     merged_chunks = []
     for b in blocks:
         if b["type"] == "DIVIDER":
@@ -653,42 +661,108 @@ def split_text_into_tagged_blocks(text, default_character="narrator", characters
         char = b["character"]
         emotion = b.get("emotion", "")
         text_piece = b["text"]
+        f5_block = is_f5_block(char, emotion)
 
-        if (merged_chunks and merged_chunks[-1]["type"] == "VOICE"
-                and merged_chunks[-1]["character"] == char
-                and merged_chunks[-1].get("emotion", "") == emotion):
-            prev_len = len(merged_chunks[-1]["text"])
-            char_cfg = (characters_map or {}).get(char.lower(), {})
-            is_f5 = char_cfg.get("engine", "").lower() in ["f5tts", "f5-tts"] or "f5" in char.lower()
-            max_limit = MAX_CHARS_PER_F5_CHUNK if is_f5 else MAX_CHARS_PER_KOKORO_CHUNK
-            if prev_len + len(text_piece) + 2 <= max_limit:
-                merged_chunks[-1]["text"] += "\n\n" + text_piece
+        pieces = (
+            split_sentences(text_piece, max_len=MAX_CHARS_PER_F5_CHUNK, min_chunk_len=MIN_CHARS_PER_F5_CHUNK)
+            if f5_block
+            else [text_piece]
+        )
+
+        for piece in pieces:
+            if not piece:
                 continue
+            if (merged_chunks and merged_chunks[-1]["type"] == "VOICE"
+                    and merged_chunks[-1]["character"] == char
+                    and merged_chunks[-1].get("emotion", "") == emotion):
+                prev_len = len(merged_chunks[-1]["text"])
+                max_limit = MAX_CHARS_PER_F5_CHUNK if f5_block else MAX_CHARS_PER_KOKORO_CHUNK
+                can_merge = (prev_len + len(piece) + 2 <= max_limit)
+                if f5_block and not can_merge:
+                    # Merge short trailing/leading words ("Yes.", "Okay.") unless chunk grows overly large
+                    if (prev_len < MIN_CHARS_PER_F5_CHUNK or len(piece) < MIN_CHARS_PER_F5_CHUNK) and (prev_len + len(piece) + 2 <= MAX_CHARS_PER_F5_CHUNK + MIN_CHARS_PER_F5_CHUNK):
+                        can_merge = True
+                if can_merge:
+                    merged_chunks[-1]["text"] += (" " if f5_block else "\n\n") + piece
+                    continue
 
-        merged_chunks.append({
-            "type": "VOICE",
-            "character": char,
-            "emotion": emotion,
-            "text": text_piece
-        })
+            merged_chunks.append({
+                "type": "VOICE",
+                "character": char,
+                "emotion": emotion,
+                "text": piece
+            })
 
     return merged_chunks
 
 
-def split_sentences(text, max_len=250):
-    """Splits long text on sentence boundaries for optimal F5-TTS flow matching."""
-    sentences = re.split(r'(?<=[.!?…])\s+', text.strip())
+_SENTENCE_ABBREVS = {
+    "mr.", "mrs.", "ms.", "dr.", "prof.", "sr.", "jr.", "st.", "vs.", "etc.", "e.g.", "i.e.", "a.m.", "p.m."
+}
+
+
+def _tokenize_sentences(text):
+    """Splits text into clean sentence strings while preserving abbreviations, mid-sentence ellipses, and quotes."""
+    cleaned = text.strip()
+    if not cleaned:
+        return []
+
+    raw_sentences = []
+    start = 0
+    for m in re.finditer(r'([.!?…]+["\'\)\]\u201d\u2019]*)\s+', cleaned):
+        punct = m.group(1)
+        before = cleaned[start:m.end(1)].rstrip()
+        after = cleaned[m.end():]
+        last_word = before.split()[-1].strip('"\'(\u201c').lower() if before.split() else ""
+        if last_word in _SENTENCE_ABBREVS:
+            continue
+        # Don't split on an ellipsis/period followed immediately by a lowercase continuation word
+        if ("..." in punct or "…" in punct or punct.startswith(".")) and "!" not in punct and "?" not in punct:
+            if re.match(r'^["\'\(\u201c\u2018]*[a-z]', after):
+                continue
+        piece = before.strip()
+        if piece:
+            raw_sentences.append(piece)
+        start = m.end()
+
+    tail = cleaned[start:].strip()
+    if tail:
+        raw_sentences.append(tail)
+
+    # Fold pure non-word punctuation fragments into neighboring sentence instead of emitting empty audio
+    sentences = []
+    for piece in raw_sentences:
+        if not re.search(r'[A-Za-z0-9]', piece) and sentences:
+            sentences[-1] = (sentences[-1] + " " + piece).strip()
+        else:
+            sentences.append(piece)
+    return sentences or [cleaned]
+
+
+def split_sentences(text, max_len=250, min_chunk_len=0):
+    """
+    Splits text on sentence boundaries.
+    - When max_len is None or <= 0: returns one sentence per item.
+    - When max_len > 0: groups consecutive sentences up to max_len characters, folding tiny
+      sentences (< min_chunk_len, e.g. 'Yes.', 'No.', 'Okay.') with adjacent text cleanly.
+    """
+    sentences = _tokenize_sentences(text)
+    if not max_len or max_len <= 0:
+        return sentences
+
     chunks = []
     current = ""
     for s in sentences:
-        s = s.strip()
         if not s:
             continue
-        if len(current) + len(s) + 1 <= max_len:
-            current = (current + " " + s).strip() if current else s
+        if not current:
+            current = s
+        elif len(current) + len(s) + 1 <= max_len:
+            current = current + " " + s
+        elif min_chunk_len > 0 and (len(current) < min_chunk_len or len(s) < min_chunk_len) and (len(current) + len(s) + 1 <= max_len + min_chunk_len):
+            current = current + " " + s
         else:
-            if current:
-                chunks.append(current)
+            chunks.append(current)
             current = s
     if current:
         chunks.append(current)

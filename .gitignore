@@ -17,6 +17,8 @@ ENV/
 # Exclude all copyrighted / user raw book texts (keep empty raw_txt directory)
 raw_txt/*
 !raw_txt/.gitkeep
+raw_epub/*
+*.epub
 parsed_chapters/
 tagged_chapters/
 *_chapters/

@@ -37,8 +37,8 @@ TTS_Audiobook_Converter/
 ├── run_pipeline.py                 # ⭐ UNIFIED PIPELINE: Ingest -> Parse -> Tag -> Convert (All-in-One)
 │
 ├── Ingestion Tools:
-│   ├── url_to_txt.py               # Playwright web scraper for web fiction & chapters (Reader Mode)
-│   ├── batch_url_to_txt.py         # Batch URL scraper from a list of web links
+│   ├── url_to_txt.py               # Playwright web scraper for web fiction & chapters (.txt or .epub)
+│   ├── batch_url_to_txt.py         # Batch URL scraper from a list of web links (.txt or .epub)
 │   └── ebook_to_txt.py             # Ebook converter for EPUB, MOBI, PDF, AZW3 to raw text
 │
 ├── Processing Tools:
@@ -134,12 +134,13 @@ For full control over each stage, you can also run the modular tools independent
 * **Web URL**:
   ```powershell
   python url_to_txt.py "https://example.com/story/chapter1" --reader
+  python url_to_txt.py "https://example.com/story/chapter1" --reader --epub
   ```
 * **Ebook File**:
   ```powershell
   python ebook_to_txt.py "C:\Books\sample.epub"
   ```
-Clean text is automatically saved into `raw_txt/`.
+Clean text is automatically saved into `raw_txt/` (and EPUBs into `raw_epub/`).
 
 ### Step 2: Parse and Clean Chapters (`new_text_parser.py`)
 ```powershell
@@ -234,7 +235,7 @@ Options:
 
 Interactive Features:
 * **Voice Volume Options**: Choose between Auto-balanced (`volume` multipliers applied), Unbalanced / Raw (`volume` multipliers only), or open the live Volume Adjustment Editor to update `characters.json`.
-* **Chunk-Level Re-Recording (`[4]` or `--rerecord`)**: Pick specific chunk numbers (`2`, `5-7`, `all`) inside any chapter to re-record, switch to another character, switch to one of the same character's emotion/alt voices, adjust chunk volume, or reset chunks while keeping all other chunks untouched (`chunk_overrides.json`).
+* **Chunk-Level Re-Recording (`[4]` or `--rerecord`)**: Pick specific chunk numbers (`2`, `5-7`, `all`) inside any chapter to re-record, switch to another character, switch to one of the same character's emotion/alt voices, adjust chunk volume, or reset chunks while keeping all other chunks untouched (`chunk_overrides.json`). F5-TTS dialogue uses compact sentence-grouped chunks (~140 chars) for targeted re-recording without isolating brief one-word replies.
 
 The generator will:
 1. Render Kokoro chunks on CPU and F5-TTS chunks on GPU concurrently.

@@ -2,14 +2,16 @@
 batch_url_to_txt.py
 ====================
 Reads a text file of URLs (one per line) and runs url_to_txt.py on each,
-saving all results as .txt files into raw_txt/.
+saving all results as .txt files into raw_txt/ and/or .epub files into raw_epub/.
 
 Usage:
   python batch_url_to_txt.py <links_file.txt> [options]
 
 Options:
-  --reader-all   Force Reader Mode for every link regardless of domain.
-  --no-reader    Disable automatic Reader Mode for Ellipsus/Tumblr/AO3 links.
+  --reader-all       Force Reader Mode for every link regardless of domain.
+  --no-reader        Disable automatic Reader Mode for Ellipsus/Tumblr/AO3 links.
+  --epub             Save outputs as .epub instead of .txt (shorthand for --format epub).
+  --format FORMAT    Output format: txt (default), epub, or both.
 
 Links file format:
   - One URL per line
@@ -22,6 +24,7 @@ Domains that automatically use Reader Mode (unless --no-reader):
 Example:
   python batch_url_to_txt.py my_links.txt
   python batch_url_to_txt.py my_links.txt --reader-all
+  python batch_url_to_txt.py my_links.txt --epub
 """
 
 import argparse
@@ -29,6 +32,7 @@ import os
 import sys
 
 RAW_TXT_DIR = "raw_txt"
+RAW_EPUB_DIR = "raw_epub"
 
 # Domains where Reader Mode is applied automatically
 READER_MODE_DOMAINS = [
@@ -49,12 +53,16 @@ def process_links_file(
     txt_file_path: str,
     force_reader: bool = False,
     no_reader: bool = False,
+    output_format: str = "txt",
 ):
     if not os.path.exists(txt_file_path):
         print(f"[X] Error: The file '{txt_file_path}' was not found.")
         return
 
-    os.makedirs(RAW_TXT_DIR, exist_ok=True)
+    if output_format in ("txt", "both"):
+        os.makedirs(RAW_TXT_DIR, exist_ok=True)
+    if output_format in ("epub", "both"):
+        os.makedirs(RAW_EPUB_DIR, exist_ok=True)
 
     print(f"[*] Reading links from '{txt_file_path}'...")
     with open(txt_file_path, "r", encoding="utf-8") as f:
@@ -93,7 +101,11 @@ def process_links_file(
         print("-" * 60)
 
         try:
-            result_path = scrape_url_to_txt(url=url, reader_mode=use_reader)
+            result_path = scrape_url_to_txt(
+                url=url,
+                reader_mode=use_reader,
+                output_format=output_format,
+            )
             if result_path and os.path.exists(result_path):
                 success_count += 1
                 print(f"[+] Done: {result_path}\n")
@@ -105,11 +117,17 @@ def process_links_file(
             print(f"[-] Error processing {url}: {e}\n")
 
     # Summary
+    output_dirs = []
+    if output_format in ("txt", "both"):
+        output_dirs.append(os.path.abspath(RAW_TXT_DIR))
+    if output_format in ("epub", "both"):
+        output_dirs.append(os.path.abspath(RAW_EPUB_DIR))
+
     print("=" * 60)
     print("Batch processing complete!")
     print(f"  Successful : {success_count}/{len(links)}")
     print(f"  Failed     : {len(failed_links)}/{len(links)}")
-    print(f"  Output dir : {os.path.abspath(RAW_TXT_DIR)}")
+    print(f"  Output dir : {', '.join(output_dirs)}")
     if failed_links:
         print("\nFailed URLs:")
         for url in failed_links:
@@ -119,7 +137,7 @@ def process_links_file(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Batch-convert a list of URLs to .txt files in raw_txt/."
+        description="Batch-convert a list of URLs to .txt (raw_txt/) and/or .epub (raw_epub/) files."
     )
     parser.add_argument(
         "txt_file",
@@ -135,10 +153,26 @@ if __name__ == "__main__":
         action="store_true",
         help="Disable automatic Reader Mode for all URLs.",
     )
+    parser.add_argument(
+        "--epub",
+        action="store_true",
+        help="Save outputs as .epub instead of .txt (shorthand for --format epub).",
+    )
+    parser.add_argument(
+        "--format",
+        choices=("txt", "epub", "both"),
+        default=None,
+        help="Output format: txt (default), epub, or both.",
+    )
 
     args = parser.parse_args()
+    if args.epub and args.format == "txt":
+        parser.error("--epub cannot be combined with --format txt.")
+
+    selected_format = args.format if args.format is not None else ("epub" if args.epub else "txt")
     process_links_file(
         txt_file_path=args.txt_file,
         force_reader=args.reader_all,
         no_reader=args.no_reader,
+        output_format=selected_format,
     )
