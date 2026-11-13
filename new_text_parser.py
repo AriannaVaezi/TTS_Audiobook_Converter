@@ -390,11 +390,8 @@ def clean_web_fiction_header_and_metadata(raw_text, input_file_path):
             last_title_match = matches[-1]
             body_text = body_text[last_title_match.end():].strip()
 
-    # Pre-clean Ellipsus header and socials
+    # Pre-clean Ellipsus socials (header already stripped above)
     if is_ellipsus:
-        first_line_end = body_text.find("\n")
-        if first_line_end != -1:
-            body_text = body_text[first_line_end + 1:].strip()
         body_text = re.sub(r"(?im)^\s*Socials\s*:.*$\n*", "", body_text)
 
     # Cut end notes / afterword / footer comments across all formats
