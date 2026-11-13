@@ -47,6 +47,12 @@ F5-TTS/
 test_code/
 scratch/
 
+# Browser session state & cookies (keep credentials private)
+.playwright_auth.json
+*cookies*.json
+*cookies*.txt
+*storage_state*.json
+
 # Legacy / unused files (excluded from GitHub submission)
 *.txt
 !requirements.txt

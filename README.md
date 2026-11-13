@@ -144,6 +144,13 @@ For full control over each stage, you can also run the modular tools independent
   ```powershell
   python url_to_txt.py "https://example.com/story/chapter1" --reader
   python url_to_txt.py "https://example.com/story/chapter1" --reader --epub
+  # For login-walled or dashboard-only Tumblr / AO3 posts:
+  # 1. Automatic: Tumblr URLs (www.tumblr.com/<blog>/<id>) are automatically rewritten to
+  #    public blog subdomains (<blog>.tumblr.com/post/<id>) with a /mobile fallback.
+  # 2. One-time interactive login (saves session to .playwright_auth.json for all future runs):
+  python url_to_txt.py "https://www.tumblr.com/..." --reader --login
+  # 3. Or pass exported browser cookies (Netscape cookies.txt or JSON):
+  python url_to_txt.py "https://www.tumblr.com/..." --reader --cookies cookies.txt
   ```
 * **Ebook File**:
   ```powershell
@@ -156,13 +163,18 @@ Clean text is automatically saved into `raw_txt/` (and EPUBs into `raw_epub/`).
 python new_text_parser.py
 # Or append to an existing book directly via CLI:
 python new_text_parser.py raw_txt/chapter_6.txt --append-to "My_Book_Title"
+# Cut opening/closing paragraphs (e.g. author's notes) while preserving Title + Author:
+python new_text_parser.py raw_txt/story.txt --new-book --cut-start 1 --cut-end 2
+# Or interactively preview and cut opening/closing paragraphs:
+python new_text_parser.py raw_txt/story.txt --new-book --review-paragraphs
 ```
-* **Interactive Prompts**:
+* **Interactive Prompts & CLI Options**:
   1. **File Selection**: Choose which file from `raw_txt/` to process.
-  2. **Book Destination**: Choose between creating a new book or adding chapter(s) to an existing book.
-  3. **Multi-Newline Dividers**: Convert consecutive blank lines into `***` scene pauses.
-  4. **Hard-Wrap Healing**: Merge lines split by manual line breaks into natural paragraphs.
-  5. **Trailing Section Review**: Review trailing sections chapter-by-chapter (with live excerpts) to remove author notes.
+  2. **Book Destination**: Choose between creating a new book (`--new-book`) or adding chapter(s) to an existing book (`--append-to`).
+  3. **Multi-Newline Dividers**: Convert consecutive blank lines into `***` scene pauses (`--multi-nl` / `--no-multi-nl`).
+  4. **Hard-Wrap Healing**: Merge lines split by manual line breaks into natural paragraphs (`--unwrap` / `--no-unwrap`).
+  5. **Trailing Section Review**: Review trailing `***`-separated sections chapter-by-chapter (`--trailing interactive`) or cut in bulk (`--trailing bulk --bulk-cut N`).
+  6. **Paragraph Trimming (Start & End)**: Cut $N$ paragraphs from the beginning (`--cut-start N`) and/or end (`--cut-end N`) of each chapter/work while preserving the Title, Author, and Chapter headers, or preview and cut paragraphs interactively (`--review-start`, `--review-end`, `--review-paragraphs`).
 * **Adding Chapters to an Existing Book**:
   * **Select Any Book Destination**: In interactive mode, select from a numbered list of existing books in your workspace, or choose `[0]` to type any custom/alternate book title. Or use `--append-to "Custom_Title"` via CLI.
   * **Selective Chapter Appending (`--chapters`)**: Pass specific chapter numbers or ranges via `--chapters "5"`, `--chapters "5-8"`, or `--chapters "5+"`, or pick them interactively from the chapter selection menu.

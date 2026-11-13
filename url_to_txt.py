@@ -31,10 +31,14 @@ import os
 import re
 import sys
 import uuid
+import json
+import urllib.parse
+import http.cookiejar
 
 RAW_TXT_DIR = "raw_txt"
 RAW_EPUB_DIR = "raw_epub"
 SUPPORTED_OUTPUT_FORMATS = ("txt", "epub", "both")
+DEFAULT_STORAGE_STATE_FILE = ".playwright_auth.json"
 
 _NO_CONTENT_TAGS = (
     "script", "style", "nav", "header", "footer", "aside", "button",
@@ -849,14 +853,227 @@ def _expand_tumblr_keep_reading(page, url: str, max_clicks: int = 5) -> int:
     return clicks_done
 
 
+def _normalize_tumblr_url(url: str) -> tuple[str, str | None, str | None, str | None]:
+    """
+    Normalizes Tumblr URLs and identifies custom subdomain blogs.
+    Returns (canonical_url, blog_name, post_id, archive_fallback_url).
+    Dashboard/login-walled URLs like `https://www.tumblr.com/<blog>/<post_id>/<slug>`
+    often redirect to a login wall on `www.tumblr.com`, whereas the canonical blog
+    subdomain `https://<blog>.tumblr.com/post/<post_id>/<slug>` or `/mobile` / `/embed`
+    can be publicly accessible without logging in.
+    """
+    if not url:
+        return url, None, None, None
+    parsed = urllib.parse.urlparse(url.strip())
+    host = (parsed.netloc or "").lower()
+    path = parsed.path or ""
+
+    reserved_paths = {
+        "login", "register", "dashboard", "settings", "explore", "search",
+        "tagged", "likes", "following", "blog", "post", "reblog", "inbox",
+        "messages", "activity", "customize", "communities", "privacy", "policy",
+    }
+
+    # Case 1: https://www.tumblr.com/<blog>/<post_id>[/<slug>] or /blog/view/<blog>/<post_id>
+    if host in ("www.tumblr.com", "tumblr.com"):
+        m_view = re.match(r"^/blog/view/([a-zA-Z0-9_-]+)(?:/(\d+)(?:/([^/?#]*))?)?", path)
+        if m_view:
+            blog, post_id, slug = m_view.group(1), m_view.group(2), m_view.group(3)
+            if post_id:
+                slug_part = f"/{slug}" if slug else ""
+                canon = f"https://{blog}.tumblr.com/post/{post_id}{slug_part}"
+                fallback = f"https://{blog}.tumblr.com/post/{post_id}/mobile"
+                return canon, blog, post_id, fallback
+            return f"https://{blog}.tumblr.com", blog, None, None
+
+        m_dash = re.match(r"^/([a-zA-Z0-9_-]+)/(\d+)(?:/([^/?#]*))?", path)
+        if m_dash and m_dash.group(1).lower() not in reserved_paths:
+            blog, post_id, slug = m_dash.group(1), m_dash.group(2), m_dash.group(3)
+            slug_part = f"/{slug}" if slug else ""
+            canon = f"https://{blog}.tumblr.com/post/{post_id}{slug_part}"
+            fallback = f"https://{blog}.tumblr.com/post/{post_id}/mobile"
+            return canon, blog, post_id, fallback
+
+    # Case 2: https://<blog>.tumblr.com/post/<post_id>[/<slug>] or https://<blog>.tumblr.com/<post_id>
+    m_sub = re.match(r"^([a-zA-Z0-9_-]+)\.tumblr\.com$", host)
+    if m_sub and m_sub.group(1).lower() != "www":
+        blog = m_sub.group(1)
+        m_post = re.match(r"^/(?:post/)?(\d+)(?:/([^/?#]*))?", path)
+        if m_post:
+            post_id, slug = m_post.group(1), m_post.group(2)
+            slug_part = f"/{slug}" if slug and slug.lower() != "mobile" else ""
+            canon = f"https://{blog}.tumblr.com/post/{post_id}{slug_part}"
+            fallback = f"https://{blog}.tumblr.com/post/{post_id}/mobile"
+            return canon, blog, post_id, fallback
+
+    return url, None, None, None
+
+
+def _load_cookies_from_file(cookie_path: str) -> list[dict]:
+    """
+    Loads cookies from either a Netscape cookies.txt file or a JSON cookie export
+    (e.g. from Cookie-Editor / EditThisCookie / Playwright storage state).
+    """
+    if not cookie_path or not os.path.isfile(cookie_path):
+        return []
+
+    with open(cookie_path, "r", encoding="utf-8", errors="ignore") as f:
+        raw = f.read().strip()
+
+    if not raw:
+        return []
+
+    # JSON format (list of cookie dicts or Playwright storage_state dict)
+    if raw.startswith(("{", "[")):
+        try:
+            data = json.loads(raw)
+            if isinstance(data, dict) and "cookies" in data:
+                data = data["cookies"]
+            if isinstance(data, list):
+                out = []
+                for c in data:
+                    if not isinstance(c, dict) or not c.get("name"):
+                        continue
+                    cookie_entry = {
+                        "name": str(c["name"]),
+                        "value": str(c.get("value", "")),
+                        "domain": str(c.get("domain", ".tumblr.com")),
+                        "path": str(c.get("path", "/")),
+                    }
+                    if "secure" in c:
+                        cookie_entry["secure"] = bool(c["secure"])
+                    if "httpOnly" in c:
+                        cookie_entry["httpOnly"] = bool(c["httpOnly"])
+                    out.append(cookie_entry)
+                return out
+        except Exception as e:
+            print(f"[!] Warning: Could not parse JSON cookies from '{cookie_path}': {e}")
+            return []
+
+    # Netscape cookies.txt format
+    cookies = []
+    try:
+        cj = http.cookiejar.MozillaCookieJar()
+        cj.load(cookie_path, ignore_discard=True, ignore_expires=True)
+        for c in cj:
+            cookies.append({
+                "name": c.name,
+                "value": c.value or "",
+                "domain": c.domain or ".tumblr.com",
+                "path": c.path or "/",
+                "secure": bool(c.secure),
+            })
+    except Exception:
+        # Fallback manual tab-separated line parser for Netscape format
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split("\t")
+            if len(parts) >= 7:
+                cookies.append({
+                    "name": parts[5],
+                    "value": parts[6],
+                    "domain": parts[0],
+                    "path": parts[2] or "/",
+                    "secure": parts[3].upper() == "TRUE",
+                })
+    return cookies
+
+
+def _dismiss_tumblr_walls_and_check_login(page) -> bool:
+    """
+    Dismisses soft Tumblr login/consent/safe-mode overlays and returns True
+    if the page is still hard-blocked by a Tumblr login wall.
+    """
+    try:
+        state = page.evaluate("""
+            () => {
+                // 1. Remove fixed login / glass / signup banners & modal backdrops
+                const overlaySelectors = [
+                    '[data-testid="glass-container"]',
+                    '[aria-label*="log in" i][role="dialog"]',
+                    '[aria-label*="sign up" i][role="dialog"]',
+                    '#glass-container',
+                    '.standalone-ad-container',
+                    '[class*="loginWall" i]',
+                    '[class*="LoginWall" i]',
+                    '[class*="signupWall" i]',
+                ];
+                for (const sel of overlaySelectors) {
+                    document.querySelectorAll(sel).forEach(el => {
+                        // Only remove if it doesn't contain the primary article
+                        if (!el.querySelector('article')) {
+                            el.remove();
+                        }
+                    });
+                }
+                if (document.body) {
+                    document.body.style.overflow = 'auto';
+                }
+                if (document.documentElement) {
+                    document.documentElement.style.overflow = 'auto';
+                }
+
+                // 2. Click "View post" / "Yes, I am over 18" / "Proceed" / mature content buttons if present
+                const buttons = document.querySelectorAll('button, a[role="button"]');
+                for (const btn of buttons) {
+                    const txt = (btn.innerText || btn.textContent || '').trim().toLowerCase();
+                    if (
+                        txt === 'view post' ||
+                        txt === 'show post' ||
+                        txt === 'proceed' ||
+                        txt === 'yes, i am over 18' ||
+                        txt === 'dismiss' ||
+                        txt === 'maybe later' ||
+                        txt === 'not now'
+                    ) {
+                        try { btn.click(); } catch (e) {}
+                    }
+                }
+
+                // 3. Check if we are redirected to /login or /safe-mode or have no post content
+                const href = (window.location.href || '').toLowerCase();
+                const bodyText = (document.body ? document.body.innerText : '').trim();
+                const hasArticle = Boolean(
+                    document.querySelector('article, .post, #posts .post, .body-text, .post-body')
+                    && bodyText.length > 350
+                );
+                const isLoginUrl = (
+                    href.includes('tumblr.com/login') ||
+                    href.includes('tumblr.com/register') ||
+                    href.includes('tumblr.com/safe-mode') ||
+                    href.includes('tumblr.com/privacy/consent')
+                );
+                const isLoginText = (
+                    !hasArticle && (
+                        /log\\s+in\\s+to\\s+tumblr/i.test(bodyText) ||
+                        /sign\\s+up\\s+or\\s+log\\s+in/i.test(bodyText) ||
+                        /this\\s+blog\\s+may\\s+contain\\s+sensitive\\s+media/i.test(bodyText) ||
+                        /only\\s+logged-in\\s+users\\s+can\\s+view/i.test(bodyText)
+                    )
+                );
+                return Boolean(isLoginUrl || isLoginText);
+            }
+        """)
+        return bool(state)
+    except Exception:
+        return False
+
+
 def _fetch_url_html_with_playwright(
     url: str,
     reader_mode: bool = False,
     headless: bool = True,
+    cookies_file: str = None,
+    storage_state_file: str = None,
+    interactive_login: bool = False,
 ) -> tuple[str, str, str, str]:
     """
     Loads a URL with Playwright Chromium and returns
     (extracted_html, raw_page_title, meta_title, meta_author).
+    Supports Tumblr URL canonicalization, login wall dismissal, saved storage state,
+    cookie import, and interactive login saving.
     """
     try:
         from playwright.sync_api import sync_playwright
@@ -864,7 +1081,16 @@ def _fetch_url_html_with_playwright(
         print("[X] Playwright is not installed. Run: pip install playwright && playwright install chromium")
         sys.exit(1)
 
-    print(f"[*] Opening '{url}'...")
+    canon_url, tumblr_blog, tumblr_post_id, tumblr_mobile_url = _normalize_tumblr_url(url)
+    target_url = canon_url or url
+    if target_url != url:
+        print(f"[*] Normalized Tumblr URL to blog subdomain: '{target_url}'")
+
+    resolved_state_file = storage_state_file or DEFAULT_STORAGE_STATE_FILE
+    if interactive_login:
+        headless = False
+
+    print(f"[*] Opening '{target_url}'...")
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=headless,
@@ -875,20 +1101,55 @@ def _fetch_url_html_with_playwright(
             ],
         )
 
-        context = browser.new_context(
-            user_agent=(
+        context_kwargs = {
+            "user_agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/122.0.0.0 Safari/537.36"
             ),
-            viewport={"width": 1280, "height": 800},
-        )
+            "viewport": {"width": 1280, "height": 800},
+        }
+        if resolved_state_file and os.path.isfile(resolved_state_file):
+            print(f"[*] Loading saved browser session from '{resolved_state_file}'...")
+            context_kwargs["storage_state"] = resolved_state_file
+
+        context = browser.new_context(**context_kwargs)
+
+        if cookies_file:
+            loaded_cookies = _load_cookies_from_file(cookies_file)
+            if loaded_cookies:
+                try:
+                    context.add_cookies(loaded_cookies)
+                    print(f"[*] Loaded {len(loaded_cookies)} cookie(s) from '{cookies_file}'.")
+                except Exception as e:
+                    print(f"[!] Warning: Could not add cookies from '{cookies_file}': {e}")
 
         page = context.new_page()
         try:
-            page.goto(url, wait_until="networkidle", timeout=40000)
+            page.goto(target_url, wait_until="networkidle", timeout=40000)
         except Exception as e:
             print(f"[!] Warning during page load: {e} — continuing anyway.")
+
+        if interactive_login:
+            print("\n" + "=" * 68)
+            print(" [LOGIN MODE] Browser window is open.")
+            print(" Please log in (e.g. to Tumblr / AO3) in the opened Chromium window.")
+            print(" Once the story page is visible, press Enter here to save your session.")
+            print("=" * 68)
+            try:
+                input("Press Enter after logging in > ")
+            except EOFError:
+                pass
+            try:
+                context.storage_state(path=resolved_state_file)
+                print(f"[✓] Saved authenticated session to '{resolved_state_file}' for future runs!")
+            except Exception as e:
+                print(f"[!] Warning: Could not save session state: {e}")
+            try:
+                if page.url != target_url and ("login" in page.url.lower() or "dashboard" in page.url.lower()):
+                    page.goto(target_url, wait_until="networkidle", timeout=40000)
+            except Exception:
+                pass
 
         # Wait for initial story paragraphs to hydrate
         print("[*] Waiting for page content to load...")
@@ -899,9 +1160,28 @@ def _fetch_url_html_with_playwright(
         except Exception:
             print("[!] Paragraph wait timed out. Proceeding with current content.")
 
+        # Check for Tumblr login wall / overlays and try public mobile fallback if needed
+        is_tumblr_candidate = "tumblr.com" in target_url.lower() or bool(tumblr_blog)
+        if is_tumblr_candidate:
+            still_walled = _dismiss_tumblr_walls_and_check_login(page)
+            if still_walled and tumblr_mobile_url and page.url.rstrip("/") != tumblr_mobile_url.rstrip("/"):
+                print(f"[*] Tumblr login wall detected; trying public mobile view: '{tumblr_mobile_url}'...")
+                try:
+                    page.goto(tumblr_mobile_url, wait_until="networkidle", timeout=30000)
+                    page.wait_for_timeout(1000)
+                    still_walled = _dismiss_tumblr_walls_and_check_login(page)
+                except Exception:
+                    pass
+            if still_walled:
+                print(
+                    "[!] Warning: This Tumblr blog appears to be dashboard-only or age-restricted.\n"
+                    "    Tip: Run once with `--login` (opens a browser to sign in and saves your session\n"
+                    "    to '.playwright_auth.json' automatically) or pass `--cookies cookies.txt`."
+                )
+
         # Expand Tumblr 'Keep reading' cuts before scrolling / Reader Mode
-        keep_reading_clicks = _expand_tumblr_keep_reading(page, url)
-        is_tumblr_page = "tumblr.com" in (url or "").lower() or keep_reading_clicks > 0
+        keep_reading_clicks = _expand_tumblr_keep_reading(page, target_url)
+        is_tumblr_page = is_tumblr_candidate or keep_reading_clicks > 0
 
         if is_tumblr_page:
             # Tumblr uses a virtualized feed: scrolling to document.body.scrollHeight
@@ -1111,6 +1391,9 @@ def scrape_url_to_txt(
     output_format: str = "txt",
     title: str = None,
     author: str = None,
+    cookies_file: str = None,
+    storage_state_file: str = None,
+    interactive_login: bool = False,
 ):
     """
     Scrapes a webpage (or reads a local .html/.txt file) and saves clean .txt and/or .epub.
@@ -1160,6 +1443,9 @@ def scrape_url_to_txt(
         url=url,
         reader_mode=reader_mode,
         headless=headless,
+        cookies_file=cookies_file,
+        storage_state_file=storage_state_file,
+        interactive_login=interactive_login,
     )
     resolved_meta_title = title or clean_story_title(meta_title)
     resolved_meta_author = author or meta_author
@@ -1189,6 +1475,26 @@ if __name__ == "__main__":
         "--visible",
         action="store_true",
         help="Run browser visibly (non-headless) for debugging.",
+    )
+    parser.add_argument(
+        "--login", "--save-login",
+        dest="interactive_login",
+        action="store_true",
+        help="Open a visible browser so you can log in (e.g. Tumblr/AO3) and save your session to .playwright_auth.json.",
+    )
+    parser.add_argument(
+        "--cookies",
+        dest="cookies_file",
+        type=str,
+        default=None,
+        help="Path to a Netscape cookies.txt or JSON cookies file for authenticated scraping.",
+    )
+    parser.add_argument(
+        "--auth-state", "--storage-state",
+        dest="storage_state_file",
+        type=str,
+        default=None,
+        help=f"Path to Playwright storage state file (default: {DEFAULT_STORAGE_STATE_FILE}).",
     )
     parser.add_argument(
         "--epub",
@@ -1234,9 +1540,12 @@ if __name__ == "__main__":
     scrape_url_to_txt(
         url=args.url,
         reader_mode=args.reader,
-        headless=not args.visible,
+        headless=not (args.visible or args.interactive_login),
         output_name=args.out,
         output_format=selected_format,
         title=args.title,
         author=args.author,
+        cookies_file=args.cookies_file,
+        storage_state_file=args.storage_state_file,
+        interactive_login=args.interactive_login,
     )

@@ -54,6 +54,9 @@ def process_links_file(
     force_reader: bool = False,
     no_reader: bool = False,
     output_format: str = "txt",
+    cookies_file: str = None,
+    storage_state_file: str = None,
+    interactive_login: bool = False,
 ):
     if not os.path.exists(txt_file_path):
         print(f"[X] Error: The file '{txt_file_path}' was not found.")
@@ -105,6 +108,9 @@ def process_links_file(
                 url=url,
                 reader_mode=use_reader,
                 output_format=output_format,
+                cookies_file=cookies_file,
+                storage_state_file=storage_state_file,
+                interactive_login=(interactive_login and i == 1),
             )
             if result_path and os.path.exists(result_path):
                 success_count += 1
@@ -164,6 +170,26 @@ if __name__ == "__main__":
         default=None,
         help="Output format: txt (default), epub, or both.",
     )
+    parser.add_argument(
+        "--login", "--save-login",
+        dest="interactive_login",
+        action="store_true",
+        help="Open a visible browser on the first link to log in and save session to .playwright_auth.json.",
+    )
+    parser.add_argument(
+        "--cookies",
+        dest="cookies_file",
+        type=str,
+        default=None,
+        help="Path to a Netscape cookies.txt or JSON cookies file for authenticated scraping.",
+    )
+    parser.add_argument(
+        "--auth-state", "--storage-state",
+        dest="storage_state_file",
+        type=str,
+        default=None,
+        help="Path to Playwright storage state file (default: .playwright_auth.json).",
+    )
 
     args = parser.parse_args()
     if args.epub and args.format == "txt":
@@ -175,4 +201,7 @@ if __name__ == "__main__":
         force_reader=args.reader_all,
         no_reader=args.no_reader,
         output_format=selected_format,
+        cookies_file=args.cookies_file,
+        storage_state_file=args.storage_state_file,
+        interactive_login=args.interactive_login,
     )

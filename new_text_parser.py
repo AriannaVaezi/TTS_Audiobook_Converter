@@ -306,6 +306,223 @@ def cut_trailing_sections_bulk(body_text, cut_count):
     return "\n\n***\n\n".join(retained).strip()
 
 
+def _split_body_paragraphs(body_text):
+    """Splits chapter/work body text into non-empty paragraph blocks (separated by blank lines)."""
+    return [p.strip() for p in re.split(r"\n\s*\n", body_text.strip()) if p.strip()]
+
+
+def _join_body_paragraphs(paragraphs):
+    """Rejoins paragraph blocks and normalizes any resulting dangling/duplicate dividers."""
+    text = "\n\n".join(p.strip() for p in paragraphs if p.strip())
+    text = normalize_dividers(text)
+    text = re.sub(r"^(?:\*\*\*\s*\n\s*)+", "", text).strip()
+    text = re.sub(r"(?:\n\s*\*\*\*\s*)+$", "", text).strip()
+    return text
+
+
+def cut_paragraphs_bulk(body_text, start_count=0, end_count=0):
+    """
+    Cuts `start_count` non-divider paragraphs from the beginning of `body_text`
+    and `end_count` non-divider paragraphs from the end of `body_text`
+    (excluding title/author/chapter headers, which are handled outside `body_text`).
+    Also strips any orphaned '***' dividers exposed at the cut boundaries.
+    """
+    start_n = max(0, int(start_count or 0))
+    end_n = max(0, int(end_count or 0))
+    if start_n == 0 and end_n == 0:
+        return body_text
+
+    paras = _split_body_paragraphs(body_text)
+    if not paras:
+        return body_text
+
+    # Cut from start (counting real content paragraphs, skipping standalone '***' dividers)
+    cut_s = 0
+    while paras and cut_s < start_n:
+        # Strip leading dividers first
+        while paras and paras[0] == "***":
+            paras.pop(0)
+        if not paras or len(paras) <= 1:
+            break
+        paras.pop(0)
+        cut_s += 1
+    while paras and paras[0] == "***":
+        paras.pop(0)
+
+    # Cut from end (counting real content paragraphs, skipping standalone '***' dividers)
+    cut_e = 0
+    while paras and cut_e < end_n:
+        while paras and paras[-1] == "***":
+            paras.pop()
+        if not paras or len(paras) <= 1:
+            break
+        paras.pop()
+        cut_e += 1
+    while paras and paras[-1] == "***":
+        paras.pop()
+
+    return _join_body_paragraphs(paras)
+
+
+def cut_leading_paragraphs_interactive(body_text, chapter_label="", session_state=None):
+    """
+    Interactively reviews paragraphs at the beginning of a chapter/work body
+    (excluding title, author, and chapter header) so the user can cut pre-story
+    author's notes, summaries, or tags one paragraph at a time.
+    Supports:
+      [y] Cut this opening paragraph (then shows the next opening paragraph)
+      [n] Keep & start story here (default)
+      [1-9] Cut N opening paragraphs at once
+      [a] Cut 1 opening paragraph from this & all remaining chapters
+      [s] Skip / keep opening paragraphs in all remaining chapters
+    """
+    if session_state is None:
+        session_state = {}
+
+    if session_state.get("auto_cut_start_count", 0) > 0:
+        return cut_paragraphs_bulk(body_text, start_count=session_state["auto_cut_start_count"], end_count=0)
+    if session_state.get("auto_keep_start_all"):
+        return body_text
+
+    paras = _split_body_paragraphs(body_text)
+    if len(paras) <= 1:
+        return body_text
+
+    while len(paras) > 1:
+        while paras and paras[0] == "***":
+            paras.pop(0)
+        if len(paras) <= 1:
+            break
+
+        first_para = paras[0]
+        excerpt_len = min(300, len(first_para))
+        excerpt = first_para[:excerpt_len].replace("\n", " ").strip()
+        if len(first_para) > excerpt_len:
+            excerpt += "..."
+
+        print("\n" + "=" * 70)
+        print(f"[{chapter_label}] Opening Paragraph Review ({len(paras)} paragraphs remaining)")
+        print(f"Opening paragraph ({len(first_para)} chars):")
+        print(f'"{excerpt}"')
+        print("-" * 70)
+        print("Options: [y] Cut paragraph | [n] Keep (done) | [1-9] Cut N paragraphs | [a] Cut 1 in all chapters | [s] Skip all chapters")
+        raw_choice = input("Cut this opening paragraph? [y/n/1-9/a/s] (default 'n'): ").strip().lower()
+        choice = raw_choice if raw_choice else "n"
+
+        if choice in ("a", "all"):
+            session_state["auto_cut_start_count"] = 1
+            paras.pop(0)
+            while paras and paras[0] == "***":
+                paras.pop(0)
+            print("  [+] Cut opening paragraph. Will automatically cut 1 opening paragraph from all remaining chapters.")
+            break
+        elif choice in ("s", "skip"):
+            session_state["auto_keep_start_all"] = True
+            print("  [-] Kept opening paragraph. Will keep opening paragraphs in all remaining chapters.")
+            break
+        elif choice in ("y", "yes"):
+            paras.pop(0)
+            while paras and paras[0] == "***":
+                paras.pop(0)
+            print(f"  [+] Cut opening paragraph. ({len(paras)} paragraphs remaining)")
+            continue
+        elif choice.isdigit() and int(choice) > 0:
+            n_to_cut = int(choice)
+            cut_done = 0
+            while len(paras) > 1 and cut_done < n_to_cut:
+                while paras and paras[0] == "***":
+                    paras.pop(0)
+                if len(paras) <= 1:
+                    break
+                paras.pop(0)
+                cut_done += 1
+            while paras and paras[0] == "***":
+                paras.pop(0)
+            print(f"  [+] Cut {cut_done} opening paragraph(s). ({len(paras)} paragraphs remaining)")
+            break
+        else:
+            print("  [-] Kept opening paragraph.")
+            break
+
+    return _join_body_paragraphs(paras)
+
+
+def cut_trailing_paragraphs_interactive(body_text, chapter_label="", session_state=None):
+    """
+    Interactively reviews paragraphs at the end of a chapter/work body
+    so the user can cut closing author's notes, prompts, or credits one paragraph at a time.
+    """
+    if session_state is None:
+        session_state = {}
+
+    if session_state.get("auto_cut_end_count", 0) > 0:
+        return cut_paragraphs_bulk(body_text, start_count=0, end_count=session_state["auto_cut_end_count"])
+    if session_state.get("auto_keep_end_all"):
+        return body_text
+
+    paras = _split_body_paragraphs(body_text)
+    if len(paras) <= 1:
+        return body_text
+
+    while len(paras) > 1:
+        while paras and paras[-1] == "***":
+            paras.pop()
+        if len(paras) <= 1:
+            break
+
+        last_para = paras[-1]
+        excerpt_len = min(300, len(last_para))
+        excerpt = last_para[:excerpt_len].replace("\n", " ").strip()
+        if len(last_para) > excerpt_len:
+            excerpt += "..."
+
+        print("\n" + "=" * 70)
+        print(f"[{chapter_label}] Closing Paragraph Review ({len(paras)} paragraphs remaining)")
+        print(f"Closing paragraph ({len(last_para)} chars):")
+        print(f'"{excerpt}"')
+        print("-" * 70)
+        print("Options: [y] Cut paragraph | [n] Keep (done) | [1-9] Cut N paragraphs | [a] Cut 1 in all chapters | [s] Skip all chapters")
+        raw_choice = input("Cut this closing paragraph? [y/n/1-9/a/s] (default 'n'): ").strip().lower()
+        choice = raw_choice if raw_choice else "n"
+
+        if choice in ("a", "all"):
+            session_state["auto_cut_end_count"] = 1
+            paras.pop()
+            while paras and paras[-1] == "***":
+                paras.pop()
+            print("  [+] Cut closing paragraph. Will automatically cut 1 closing paragraph from all remaining chapters.")
+            break
+        elif choice in ("s", "skip"):
+            session_state["auto_keep_end_all"] = True
+            print("  [-] Kept closing paragraph. Will keep closing paragraphs in all remaining chapters.")
+            break
+        elif choice in ("y", "yes"):
+            paras.pop()
+            while paras and paras[-1] == "***":
+                paras.pop()
+            print(f"  [+] Cut closing paragraph. ({len(paras)} paragraphs remaining)")
+            continue
+        elif choice.isdigit() and int(choice) > 0:
+            n_to_cut = int(choice)
+            cut_done = 0
+            while len(paras) > 1 and cut_done < n_to_cut:
+                while paras and paras[-1] == "***":
+                    paras.pop()
+                if len(paras) <= 1:
+                    break
+                paras.pop()
+                cut_done += 1
+            while paras and paras[-1] == "***":
+                paras.pop()
+            print(f"  [+] Cut {cut_done} closing paragraph(s). ({len(paras)} paragraphs remaining)")
+            break
+        else:
+            print("  [-] Kept closing paragraph.")
+            break
+
+    return _join_body_paragraphs(paras)
+
+
 # ==================== MAIN PARSING LOGIC ====================
 
 def clean_web_fiction_header_and_metadata(raw_text, input_file_path):
@@ -355,7 +572,7 @@ def clean_web_fiction_header_and_metadata(raw_text, input_file_path):
 
     # Pattern C: FicHub / Standard: "Title" then "By: Author"
     if not work_title:
-        by_m = re.search(r"(?im)^\s*(?:By:\s*|by\s+)([a-zA-Z0-9_\.\-]+)\s*$", raw_text)
+        by_m = re.search(r"(?im)^\s*(?:By:\s*|by\s+)([a-zA-Z0-9_\.\-]+(?:\s+[a-zA-Z0-9_\.\-]+){0,3})\s*$", raw_text)
         if by_m:
             author = by_m.group(1).strip()
             work_title = first_line.strip()
@@ -381,6 +598,28 @@ def clean_web_fiction_header_and_metadata(raw_text, input_file_path):
         first_line_end = body_text.find("\n")
         if first_line_end != -1:
             body_text = body_text[first_line_end + 1:].strip()
+    elif work_title and first_line.strip().lower() == work_title.strip().lower():
+        # Strip leading title + 'by Author' lines from body_text so they aren't duplicated
+        # when the parser prepends the Title / Author header block
+        first_line_end = body_text.find("\n")
+        if first_line_end != -1:
+            body_text = body_text[first_line_end + 1:].strip()
+            if author:
+                body_text = re.sub(
+                    rf"^\s*(?:by:?\s+){re.escape(author)}\s*(?:\n+|$)",
+                    "",
+                    body_text,
+                    count=1,
+                    flags=re.IGNORECASE,
+                ).strip()
+            else:
+                body_text = re.sub(
+                    r"^\s*(?:by:?\s+)[a-zA-Z0-9_\.\-]+(?:\s+[a-zA-Z0-9_\.\-]+){0,3}\s*(?:\n+|$)",
+                    "",
+                    body_text,
+                    count=1,
+                    flags=re.IGNORECASE,
+                ).strip()
 
     # Pre-clean AO3 preamble / summary / notes for single works
     if is_ao3 and work_title:
@@ -639,6 +878,10 @@ def parse_book_file(
     select_chapters=None,
     interactive=True,
     overwrite_existing=None,
+    cut_start_paragraphs=0,
+    cut_end_paragraphs=0,
+    review_start_paragraphs=False,
+    review_end_paragraphs=False,
 ):
     print("\n" + "=" * 60)
     print(f"   Processing: {os.path.basename(input_file_path)}")
@@ -865,6 +1108,7 @@ def parse_book_file(
 
         # --- 2. Chapter by Chapter Processing ---
         trailing_session_state = {}
+        para_session_state = {}
         track_counter = base_track
         for i, ch_info in enumerate(valid_splits):
             start_pos = ch_info["start"]
@@ -920,6 +1164,18 @@ def parse_book_file(
             # Step: Fix hard-wrapped paragraph splits option
             if should_unwrap:
                 body_text = unwrap_hard_wraps(body_text)
+
+            # Step: Cut paragraphs from beginning and/or end (excluding chapter title / book header)
+            if cut_start_paragraphs or cut_end_paragraphs:
+                body_text = cut_paragraphs_bulk(
+                    body_text,
+                    start_count=cut_start_paragraphs,
+                    end_count=cut_end_paragraphs,
+                )
+            if review_start_paragraphs:
+                body_text = cut_leading_paragraphs_interactive(body_text, ch_label, para_session_state)
+            if review_end_paragraphs:
+                body_text = cut_trailing_paragraphs_interactive(body_text, ch_label, para_session_state)
 
             # Compute sequential chapter number if appending
             raw_chap_num = ch_info["num"]
@@ -1000,6 +1256,18 @@ def parse_book_file(
         # Step: Fix hard-wrapped paragraph splits option
         if should_unwrap:
             after_author = unwrap_hard_wraps(after_author)
+
+        # Step: Cut paragraphs from beginning and/or end (excluding title + author)
+        if cut_start_paragraphs or cut_end_paragraphs:
+            after_author = cut_paragraphs_bulk(
+                after_author,
+                start_count=cut_start_paragraphs,
+                end_count=cut_end_paragraphs,
+            )
+        if review_start_paragraphs:
+            after_author = cut_leading_paragraphs_interactive(after_author, work_title)
+        if review_end_paragraphs:
+            after_author = cut_trailing_paragraphs_interactive(after_author, work_title)
 
         if safe_target_book:
             computed_chap_num = (base_chap + 1) if base_chap >= 1 else 1
@@ -1104,6 +1372,11 @@ def main():
     parser.add_argument("--no-unwrap", dest="unwrap", action="store_false", help="Do not unwrap hard-wrapped lines")
     parser.add_argument("--trailing", choices=["none", "interactive", "bulk"], default=None, help="Trailing section cut mode")
     parser.add_argument("--bulk-cut", type=int, default=1, help="Number of trailing sections to cut per chapter in bulk mode")
+    parser.add_argument("--cut-start-paragraphs", "--cut-start", dest="cut_start_paragraphs", type=int, default=None, help="Cut N paragraphs from the beginning of each chapter/work (excluding title + author)")
+    parser.add_argument("--cut-end-paragraphs", "--cut-end", dest="cut_end_paragraphs", type=int, default=None, help="Cut N paragraphs from the end of each chapter/work")
+    parser.add_argument("--review-start-paragraphs", "--review-start", dest="review_start_paragraphs", action="store_true", default=False, help="Interactively preview and cut opening paragraphs (e.g. author's notes)")
+    parser.add_argument("--review-end-paragraphs", "--review-end", dest="review_end_paragraphs", action="store_true", default=False, help="Interactively preview and cut closing paragraphs (e.g. author's notes)")
+    parser.add_argument("--review-paragraphs", dest="review_both_paragraphs", action="store_true", default=False, help="Interactively preview and cut both opening and closing paragraphs")
     parser.add_argument("--no-tag", dest="run_tagger", action="store_false", default=None, help="Skip dialogue tagging")
     parser.add_argument("--tag", dest="run_tagger", action="store_true", help="Automatically trigger dialogue tagging")
     parser.add_argument("--tag-mode", "--format", dest="tag_mode", choices=["fast", "prose", "hybrid", "script"], default=None, help="Dialogue tagging engine")
@@ -1191,6 +1464,46 @@ def main():
 
     only_new = False if args.all_chapters else (True if args.only_new else None)
 
+    # Prompt 4: Opening / Closing paragraph cutting (excluding title + author)
+    cut_start_paragraphs = args.cut_start_paragraphs or 0
+    cut_end_paragraphs = args.cut_end_paragraphs or 0
+    review_start_paragraphs = bool(args.review_start_paragraphs or args.review_both_paragraphs)
+    review_end_paragraphs = bool(args.review_end_paragraphs or args.review_both_paragraphs)
+
+    has_explicit_para_args = (
+        args.cut_start_paragraphs is not None
+        or args.cut_end_paragraphs is not None
+        or args.review_start_paragraphs
+        or args.review_end_paragraphs
+        or args.review_both_paragraphs
+    )
+    if not has_explicit_para_args and is_interactive:
+        print("\nParagraph trimming (cut author's notes from beginning/end, excluding Title + Author):")
+        print("  [0] Keep all paragraphs (no cut) [Default]")
+        print("  [1] Review opening/closing paragraphs interactively (shows excerpt before cutting)")
+        print("  [2] Bulk cut a specific number of paragraphs from beginning and/or end")
+        para_choice = input("Select option [0, 1, or 2] (default 0): ").strip()
+        if para_choice == "1":
+            where_choice = input("Review [s]tarting, [e]nding, or [b]oth? (default 'b'): ").strip().lower()
+            if where_choice == "s":
+                review_start_paragraphs = True
+            elif where_choice == "e":
+                review_end_paragraphs = True
+            else:
+                review_start_paragraphs = True
+                review_end_paragraphs = True
+        elif para_choice == "2":
+            s_in = input("How many opening paragraphs to cut (after Title/Author)? (default 0): ").strip()
+            e_in = input("How many closing paragraphs to cut from the end? (default 0): ").strip()
+            try:
+                cut_start_paragraphs = max(0, int(s_in)) if s_in else 0
+            except ValueError:
+                cut_start_paragraphs = 0
+            try:
+                cut_end_paragraphs = max(0, int(e_in)) if e_in else 0
+            except ValueError:
+                cut_end_paragraphs = 0
+
     created_files = parse_book_file(
         input_file_path=input_file,
         replacements=replacements,
@@ -1203,6 +1516,10 @@ def main():
         select_chapters=args.select_chapters,
         interactive=is_interactive,
         overwrite_existing=args.overwrite_existing,
+        cut_start_paragraphs=cut_start_paragraphs,
+        cut_end_paragraphs=cut_end_paragraphs,
+        review_start_paragraphs=review_start_paragraphs,
+        review_end_paragraphs=review_end_paragraphs,
     )
 
     implied_tag = bool(

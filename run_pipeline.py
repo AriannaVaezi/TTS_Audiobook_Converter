@@ -61,7 +61,14 @@ def is_url(target: str) -> bool:
     return parsed.scheme in ("http", "https") and bool(parsed.netloc)
 
 
-def ingest_input_source(source: str, reader_mode: bool = True) -> str:
+def ingest_input_source(
+    source: str,
+    reader_mode: bool = True,
+    cookies_file: str = None,
+    storage_state_file: str = None,
+    interactive_login: bool = False,
+    visible_browser: bool = False,
+) -> str:
     """
     Ingests any input source (URL, ebook, or text file) and returns the path
     to the corresponding .txt file inside raw_txt/.
@@ -76,7 +83,10 @@ def ingest_input_source(source: str, reader_mode: bool = True) -> str:
         raw_txt_path = url_to_txt.scrape_url_to_txt(
             url=source,
             reader_mode=reader_mode,
-            headless=True,
+            headless=not (visible_browser or interactive_login),
+            cookies_file=cookies_file,
+            storage_state_file=storage_state_file,
+            interactive_login=interactive_login,
         )
         if not raw_txt_path or not os.path.exists(raw_txt_path):
             raise RuntimeError(f"Web scraping failed for URL: '{source}'")
@@ -206,6 +216,14 @@ def run_full_pipeline(
     set_chunk_voices: list = None,
     set_chunk_volumes: list = None,
     reset_chunks: list = None,
+    cookies_file: str = None,
+    storage_state_file: str = None,
+    interactive_login: bool = False,
+    visible_browser: bool = False,
+    cut_start_paragraphs: int = 0,
+    cut_end_paragraphs: int = 0,
+    review_start_paragraphs: bool = False,
+    review_end_paragraphs: bool = False,
 ):
     """
     Executes all stages of the audiobook generator:
@@ -217,7 +235,14 @@ def run_full_pipeline(
     print_banner()
 
     # ---------------- STAGE 1: INGESTION ----------------
-    raw_txt_path = ingest_input_source(source, reader_mode=reader_mode)
+    raw_txt_path = ingest_input_source(
+        source,
+        reader_mode=reader_mode,
+        cookies_file=cookies_file,
+        storage_state_file=storage_state_file,
+        interactive_login=interactive_login,
+        visible_browser=visible_browser,
+    )
     if not os.path.exists(raw_txt_path):
         print(f"[X] Error: Could not resolve raw text path: {raw_txt_path}")
         return False
@@ -238,6 +263,10 @@ def run_full_pipeline(
         select_chapters=select_chapters,
         interactive=interactive,
         overwrite_existing=overwrite_existing,
+        cut_start_paragraphs=cut_start_paragraphs,
+        cut_end_paragraphs=cut_end_paragraphs,
+        review_start_paragraphs=review_start_paragraphs,
+        review_end_paragraphs=review_end_paragraphs,
     )
 
     if not created_chapter_files:
@@ -360,6 +389,34 @@ def main():
         help="Disable Reader Mode when scraping web URLs.",
     )
     parser.add_argument(
+        "--visible",
+        dest="visible_browser",
+        action="store_true",
+        default=False,
+        help="Run browser visibly (non-headless) when scraping a URL.",
+    )
+    parser.add_argument(
+        "--login", "--save-login",
+        dest="interactive_login",
+        action="store_true",
+        default=False,
+        help="Open a visible browser when scraping a URL to log in (e.g. Tumblr/AO3) and save session to .playwright_auth.json.",
+    )
+    parser.add_argument(
+        "--cookies",
+        dest="cookies_file",
+        type=str,
+        default=None,
+        help="Path to a Netscape cookies.txt or JSON cookies file for authenticated URL scraping.",
+    )
+    parser.add_argument(
+        "--auth-state", "--storage-state",
+        dest="storage_state_file",
+        type=str,
+        default=None,
+        help="Path to Playwright storage state file (default: .playwright_auth.json).",
+    )
+    parser.add_argument(
         "--tag",
         dest="tag_dialogue",
         action="store_true",
@@ -464,6 +521,41 @@ def main():
         type=int,
         default=0,
         help="Number of trailing sections to cut from each chapter when --trailing=bulk.",
+    )
+    parser.add_argument(
+        "--cut-start-paragraphs", "--cut-start",
+        dest="cut_start_paragraphs",
+        type=int,
+        default=0,
+        help="Cut N paragraphs from the beginning of each chapter/work (excluding title + author).",
+    )
+    parser.add_argument(
+        "--cut-end-paragraphs", "--cut-end",
+        dest="cut_end_paragraphs",
+        type=int,
+        default=0,
+        help="Cut N paragraphs from the end of each chapter/work.",
+    )
+    parser.add_argument(
+        "--review-start-paragraphs", "--review-start",
+        dest="review_start_paragraphs",
+        action="store_true",
+        default=False,
+        help="Interactively preview and cut opening paragraphs (e.g. author's notes).",
+    )
+    parser.add_argument(
+        "--review-end-paragraphs", "--review-end",
+        dest="review_end_paragraphs",
+        action="store_true",
+        default=False,
+        help="Interactively preview and cut closing paragraphs (e.g. author's notes).",
+    )
+    parser.add_argument(
+        "--review-paragraphs",
+        dest="review_both_paragraphs",
+        action="store_true",
+        default=False,
+        help="Interactively preview and cut both opening and closing paragraphs.",
     )
     parser.add_argument(
         "--unwrap",
@@ -797,6 +889,14 @@ def main():
         set_chunk_voices=args.set_chunk_voices,
         set_chunk_volumes=args.set_chunk_volumes,
         reset_chunks=args.reset_chunks,
+        cookies_file=args.cookies_file,
+        storage_state_file=args.storage_state_file,
+        interactive_login=args.interactive_login,
+        visible_browser=args.visible_browser,
+        cut_start_paragraphs=args.cut_start_paragraphs,
+        cut_end_paragraphs=args.cut_end_paragraphs,
+        review_start_paragraphs=bool(args.review_start_paragraphs or args.review_both_paragraphs),
+        review_end_paragraphs=bool(args.review_end_paragraphs or args.review_both_paragraphs),
     )
 
 
