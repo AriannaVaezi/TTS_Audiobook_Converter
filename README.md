@@ -231,26 +231,36 @@ The voice configuration file maps character names to specific TTS engines and vo
   * `emotions`: Optional dictionary mapping emotions (`shout`, `whisper`, `sad`) to dedicated reference clips (disabled when `--no-emotions` is set).
   * `alts` (or `alt_voices`): Optional dictionary mapping custom alternate voices (usable via `[Villain:calm_disguise]` or the chunk re-record menu; remains active even when `--no-emotions` is used).
 
-### Step 4: Tag Dialogue (`llm_dialogue_tagger.py`)
+### Step 4: Tag Dialogue & Review Tags (`llm_dialogue_tagger.py`)
 ```powershell
 python llm_dialogue_tagger.py
+# Or non-interactive CLI mode with direct tag inspection/editing:
+python llm_dialogue_tagger.py --input all --format fast --detect-tone --update-manifest --no-review-tags
+python llm_dialogue_tagger.py --review-only --list-tags
+python llm_dialogue_tagger.py --review-only --set-tag "1=Alice; 2,4-6=Bob:whisper; 7=untag" --remap-tag "Bobby=Bob"
 ```
 * **[1] Fast Smart Parser (Instant & 100% Quote Coverage - Recommended)**:
   * Grammar-aware speech verb attribution and conversational turn-taking.
   * Tags multi-quote lines accurately (`[Hero] "Wait!" [/Hero] he said. [Hero] "Look there." [/Hero]`).
   * Tags thousands of words in **less than 0.1 seconds**.
 * **[2] Hybrid LLM**: Fast context parser with local GPU micro-prompts (`qwen2.5:7b` via Ollama) for ambiguous multi-character scenes.
+* **Dialogue Tag Review & Editing (When Applicable)**:
+  * Automatically skips chapters/intros with 0 dialogue tags.
+  * **Interactive Review (`--review-tags` / `--review-only`)**: Inspect numbered dialogue tags with surrounding paragraph context, change speaker or emotion/alt variant, untag air-quotes back to Narrator, bulk-remap speakers, or map aliases in `tag_mappings.json`.
+  * **Non-Interactive CLI Edits**: `--list-tags`, `--filter-char <name>`, `--set-tag "<idx>=<Speaker>[:<emotion>]"`, `--untag "<idx>"`, `--remap-tag "<Old>=<New>"`, `--map-alias "<alias>=<Canon>"`.
 * **Auto-Sync**: Automatically updates `tag_mappings.json` (for nicknames/aliases) and `characters.json` (for voice setup).
 
 ### Step 5: Generate the Audiobook (`local_hybrid_audioconverter.py`)
 ```powershell
 python local_hybrid_audioconverter.py
 ```
-Options:
-* `--emotions`: Enables dialogue tone/emotion delivery (default).
-* `--no-emotions`: Renders pure baseline voices (custom `alts` voices still remain active).
-* `--no-volume-balance`: Disables automatic loudness balancing and only applies explicit `"volume"` multipliers.
-* `--rerecord`: Opens the interactive **Chunk Re-Record & Voice Switcher** directly on launch.
+CLI Parameters (no forced menus when flags are supplied):
+* **Emotion & Volume**: `--emotions` / `--no-emotions`, `--volume-balance` / `--no-volume-balance`, `--set-volume "Char=1.2"`, `--adjust-volumes`.
+* **Narrator**: `--narrator-voice "..."`, `--random-narrator` / `--keep-narrator`, `--narrator-gender`, `--narrator-accent`, `--narrator-voices`, `--save-narrator` / `--no-save-narrator`.
+* **Dialogue Tags**: `--review-tags` / `--no-review-tags`, `--list-tags`, `--set-tag`, `--untag`, `--remap-tag`, `--map-alias`.
+* **Existing Audio & Chunk Control**: `--resume`, `--rerecord-all`, `--rerecord-sections "1,3"`, `--rerecord`, `--list-chunks`, `--rerecord-chunks "2,5-7"`, `--set-chunk-voice "2,3=Bob:whisper@1.1"`, `--set-chunk-volume "2,3=1.25"`, `--reset-chunks "all"`, `--skip-render`.
+* **Mode Control**: `--interactive` (prompt for unspecified options), `--yes` / `--non-interactive` (use defaults for unspecified options).
+*(All parser, tagger, tag-review, volume, narrator, and chunk flags are also forwarded by `run_pipeline.py`!)*
 
 Interactive Features:
 * **Voice Volume Options**: Choose between Auto-balanced (`volume` multipliers applied), Unbalanced / Raw (`volume` multipliers only), or open the live Volume Adjustment Editor to update `characters.json`.

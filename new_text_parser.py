@@ -637,6 +637,8 @@ def parse_book_file(
     chapter_offset=None,
     only_new=None,
     select_chapters=None,
+    interactive=True,
+    overwrite_existing=None,
 ):
     print("\n" + "=" * 60)
     print(f"   Processing: {os.path.basename(input_file_path)}")
@@ -782,6 +784,7 @@ def parse_book_file(
             existing_chapter_nums = set(existing_info.get("existing_chapter_nums", []))
             already_present = [ch for ch in valid_splits if ch["num"] in existing_chapter_nums]
             new_splits = [ch for ch in valid_splits if ch["num"] not in existing_chapter_nums]
+            is_tty = (sys.stdin.isatty() if hasattr(sys.stdin, "isatty") else False) and interactive
 
             # Case A: Updated full work (contains both existing chapters and new chapters)
             if already_present and new_splits:
@@ -793,7 +796,6 @@ def parse_book_file(
                     ch_title_display = f": {nch['title']}" if nch.get("title") else ""
                     print(f"    • Chapter {nch['num']}{ch_title_display}")
 
-                is_tty = sys.stdin.isatty() if hasattr(sys.stdin, "isatty") else False
                 if only_new is None and is_tty:
                     print("\nChapter selection options:")
                     print(f"  [Y] Add all {len(new_splits)} new chapter(s) [Default]")
@@ -821,13 +823,17 @@ def parse_book_file(
             # Case B: File contains ONLY existing chapters (e.g. duplicate full file)
             elif already_present and not new_splits and len(already_present) >= len(existing_chapter_nums):
                 print(f"\n[*] Notice: All {len(valid_splits)} chapter(s) in this file already exist in '{safe_work_title}'.")
-                is_tty = sys.stdin.isatty() if hasattr(sys.stdin, "isatty") else False
-                if only_new is None and is_tty:
+                if overwrite_existing is False:
+                    print("[*] Keeping existing book chapters intact (--no-overwrite).")
+                    return existing_info.get("existing_manifest_files", [])
+                elif overwrite_existing is True:
+                    print("[*] Overwriting / re-parsing existing chapters (--overwrite).")
+                elif only_new is None and is_tty:
                     reparse_choice = input(f"Do you want to re-parse / overwrite existing chapters? [y/N] (default N): ").strip().lower()
                     if reparse_choice != "y":
                         print("[*] Skipped parsing. Keeping existing book chapters intact.")
                         return existing_info.get("existing_manifest_files", [])
-                elif only_new is True:
+                elif only_new is True or not is_tty:
                     print("[*] No new chapters to add. Keeping existing book chapters intact.")
                     return existing_info.get("existing_manifest_files", [])
 
@@ -1086,16 +1092,38 @@ def main():
     parser = argparse.ArgumentParser(description="Advanced Book & Chapter Text Parser")
     parser.add_argument("input_file", nargs="?", default=None, help="Path to input .txt file")
     parser.add_argument("--append-to", "--append", "--book", dest="append_to_book", default=None, help="Append chapter(s) to an existing book name")
+    parser.add_argument("--new-book", action="store_true", default=False, help="Create a new book without prompting for destination")
     parser.add_argument("--chapters", "--chaps", dest="select_chapters", default=None, help="Specific chapter numbers or ranges to process/append (e.g. '5', '5-8', '5+').")
     parser.add_argument("--only-new", action="store_true", default=None, help="When appending an updated full work, automatically extract only newly posted chapters")
     parser.add_argument("--all-chapters", action="store_true", default=False, help="Force extracting all chapters even if previous chapters exist")
-    parser.add_argument("--multi-nl", action="store_true", help="Convert multiple consecutive newlines to dividers (***)")
-    parser.add_argument("--unwrap", action="store_true", help="Unwrap hard-wrapped single-line paragraph splits")
+    parser.add_argument("--overwrite", dest="overwrite_existing", action="store_true", default=None, help="Overwrite existing chapters when re-parsing")
+    parser.add_argument("--no-overwrite", dest="overwrite_existing", action="store_false", help="Keep existing chapters when duplicates are found")
+    parser.add_argument("--multi-nl", dest="multi_nl", action="store_true", default=None, help="Convert multiple consecutive newlines to dividers (***)")
+    parser.add_argument("--no-multi-nl", dest="multi_nl", action="store_false", help="Keep multiple consecutive newlines unchanged")
+    parser.add_argument("--unwrap", dest="unwrap", action="store_true", default=None, help="Unwrap hard-wrapped single-line paragraph splits")
+    parser.add_argument("--no-unwrap", dest="unwrap", action="store_false", help="Do not unwrap hard-wrapped lines")
     parser.add_argument("--trailing", choices=["none", "interactive", "bulk"], default=None, help="Trailing section cut mode")
     parser.add_argument("--bulk-cut", type=int, default=1, help="Number of trailing sections to cut per chapter in bulk mode")
-    parser.add_argument("--no-tag", action="store_true", help="Skip dialogue tagging prompt")
-    parser.add_argument("--tag", action="store_true", help="Automatically trigger dialogue tagging")
+    parser.add_argument("--no-tag", dest="run_tagger", action="store_false", default=None, help="Skip dialogue tagging")
+    parser.add_argument("--tag", dest="run_tagger", action="store_true", help="Automatically trigger dialogue tagging")
+    parser.add_argument("--tag-mode", "--format", dest="tag_mode", choices=["fast", "prose", "hybrid", "script"], default=None, help="Dialogue tagging engine")
+    parser.add_argument("--model", "-m", dest="ollama_model", type=str, default=None, help="Ollama model name for hybrid tagging")
+    parser.add_argument("--ollama-url", dest="ollama_url", type=str, default=None, help="Ollama server URL for hybrid tagging")
+    parser.add_argument("--emotions", "--detect-tone", dest="detect_tone", action="store_true", default=None, help="Detect dialogue tone & emotions")
+    parser.add_argument("--no-emotions", "--no-detect-tone", dest="detect_tone", action="store_false", help="Disable dialogue emotion/tone detection")
+    parser.add_argument("--review-tags", "--review", dest="review_tags", action="store_true", default=None, help="Interactively review and edit dialogue tags after tagging")
+    parser.add_argument("--no-review-tags", dest="review_tags", action="store_false", help="Skip interactive dialogue tag review")
+    parser.add_argument("--list-tags", "--show-tags", action="store_true", default=False, help="List dialogue tags after tagging")
+    parser.add_argument("--set-tag", "--change-tag", "--edit-tag", dest="set_tags", action="append", default=[], help="Change tag(s), e.g. '1=Alice' or '2,4-6=Bob:whisper'")
+    parser.add_argument("--untag", dest="untag_specs", action="append", default=[], help="Remove dialogue tags so Narrator reads them")
+    parser.add_argument("--remap-tag", "--rename-tag", dest="remap_tags", action="append", default=[], help="Bulk remap a speaker tag across chapters")
+    parser.add_argument("--map-alias", dest="map_aliases", action="append", default=[], help="Map tag alias in tag_mappings.json")
+    parser.add_argument("--interactive", action="store_true", default=False, help="Prompt interactively for unspecified options")
+    parser.add_argument("--yes", "-y", "--non-interactive", dest="non_interactive", action="store_true", default=False, help="Run non-interactively with defaults for unspecified options")
     args = parser.parse_args()
+
+    has_cli_flags = len(sys.argv) > 1
+    is_interactive = args.interactive or (not has_cli_flags and not args.non_interactive)
 
     input_file = select_input_file(args.input_file)
     replacements = load_replacements()
@@ -1107,7 +1135,7 @@ def main():
         resolved = resolve_book_name(args.append_to_book, existing_books)
         append_to_book = resolved if resolved else sanitize_filename(args.append_to_book)
         print(f"[*] Target book (from argument): '{append_to_book}'")
-    else:
+    elif not args.new_book and is_interactive:
         print("\nTarget book destination:")
         print("  [1] Create a new book [Default]")
         print("  [2] Add chapter(s) to an existing book (select from list or enter title)")
@@ -1117,24 +1145,28 @@ def main():
             print(f"[*] Appending to existing book: '{append_to_book}'")
 
     # Prompt 1: Turn more than one new line in a row to '***'
-    if args.multi_nl:
-        should_convert_multi_nl = True
-    else:
+    if args.multi_nl is not None:
+        should_convert_multi_nl = args.multi_nl
+    elif is_interactive:
         multi_nl_choice = input("\nDo you want to turn more than one new line in a row into '***'? [y/n] (default 'n'): ").strip().lower()
         should_convert_multi_nl = multi_nl_choice == "y"
+    else:
+        should_convert_multi_nl = False
 
     # Prompt 2: Hard wrap healing
-    if args.unwrap:
-        should_unwrap = True
-    else:
+    if args.unwrap is not None:
+        should_unwrap = args.unwrap
+    elif is_interactive:
         unwrap_choice = input("\nDo you want to fix hard-wrapped single-line paragraph splits? [y/n] (default 'n'): ").strip().lower()
         should_unwrap = unwrap_choice == "y"
+    else:
+        should_unwrap = False
 
     # Prompt 3: Trailing sections cutting
     if args.trailing:
         trailing_mode = args.trailing
         bulk_cut_count = args.bulk_cut
-    else:
+    elif is_interactive:
         print("\nTrailing sections cutting (e.g. author notes at the end of chapters):")
         print("  [0] Keep all sections (no cut)")
         print("  [1] Review chapter-by-chapter (shows excerpt before cutting)")
@@ -1153,6 +1185,9 @@ def main():
                 bulk_cut_count = int(count_input) if count_input else 1
             except ValueError:
                 bulk_cut_count = 1
+    else:
+        trailing_mode = "none"
+        bulk_cut_count = 0
 
     only_new = False if args.all_chapters else (True if args.only_new else None)
 
@@ -1166,37 +1201,86 @@ def main():
         append_to_book=append_to_book,
         only_new=only_new,
         select_chapters=args.select_chapters,
+        interactive=is_interactive,
+        overwrite_existing=args.overwrite_existing,
     )
 
-    if created_files and not args.no_tag:
-        print("\n" + "=" * 60)
-        print("                 AI Dialogue Tagging Option")
-        print("=" * 60)
-        tag_choice = "y" if args.tag else input("Do you want to run the Dialogue Tagger on these chapters now? [y/n] (default 'n'): ").strip().lower()
-        if tag_choice == "y":
-            print("\nSelect dialogue tagging mode:")
-            print("  [1] Fast Smart Parser (Instant, 100% quote coverage, zero GPU wait) [Recommended]")
-            print("  [2] Hybrid LLM (Smart Parser + Local GPU LLM verification for ambiguous lines)")
-            print("  [3] Script Form (Screenplay / Script format: [Name]: dialogue)")
-            fmt_input = input("Enter choice [1, 2, or 3] (default 1): ").strip()
-            if fmt_input == "2":
-                chosen_format = "hybrid"
-            elif fmt_input == "3":
-                chosen_format = "script"
+    implied_tag = bool(
+        args.tag_mode is not None
+        or args.detect_tone is not None
+        or args.review_tags is True
+        or args.list_tags
+        or args.set_tags
+        or args.untag_specs
+        or args.remap_tags
+        or args.map_aliases
+    )
+    should_run_tagger = args.run_tagger if args.run_tagger is not None else (True if implied_tag else None)
+
+    if created_files and should_run_tagger is not False:
+        if should_run_tagger is None:
+            if is_interactive:
+                print("\n" + "=" * 60)
+                print("                 AI Dialogue Tagging Option")
+                print("=" * 60)
+                tag_choice = input("Do you want to run the Dialogue Tagger on these chapters now? [y/n] (default 'n'): ").strip().lower()
+                should_run_tagger = (tag_choice == "y")
+            else:
+                should_run_tagger = False
+
+        if should_run_tagger:
+            if args.tag_mode:
+                chosen_format = "prose" if args.tag_mode == "fast" else args.tag_mode
+            elif is_interactive:
+                print("\nSelect dialogue tagging mode:")
+                print("  [1] Fast Smart Parser (Instant, 100% quote coverage, zero GPU wait) [Recommended]")
+                print("  [2] Hybrid LLM (Smart Parser + Local GPU LLM verification for ambiguous lines)")
+                print("  [3] Script Form (Screenplay / Script format: [Name]: dialogue)")
+                fmt_input = input("Enter choice [1, 2, or 3] (default 1): ").strip()
+                if fmt_input == "2":
+                    chosen_format = "hybrid"
+                elif fmt_input == "3":
+                    chosen_format = "script"
+                else:
+                    chosen_format = "prose"
             else:
                 chosen_format = "prose"
 
-            tone_choice = input("Detect dialogue tone & emotions (whisper, shout, angry, etc.)? [y/n] (default 'y'): ").strip().lower()
-            detect_tone = (tone_choice != "n")
+            if args.detect_tone is not None:
+                detect_tone = args.detect_tone
+            elif is_interactive:
+                tone_choice = input("Detect dialogue tone & emotions (whisper, shout, angry, etc.)? [y/n] (default 'y'): ").strip().lower()
+                detect_tone = (tone_choice != "n")
+            else:
+                detect_tone = True
 
             try:
                 import llm_dialogue_tagger
-                tagged_files = llm_dialogue_tagger.batch_tag_files(
-                    file_paths=created_files,
-                    dialogue_format=chosen_format,
-                    detect_tone=detect_tone
-                )
+                tag_kwargs = {
+                    "file_paths": created_files,
+                    "dialogue_format": chosen_format,
+                    "detect_tone": detect_tone,
+                }
+                if args.ollama_model:
+                    tag_kwargs["model"] = args.ollama_model
+                if args.ollama_url:
+                    tag_kwargs["url"] = args.ollama_url
+                tagged_files = llm_dialogue_tagger.batch_tag_files(**tag_kwargs)
                 if tagged_files:
+                    if args.list_tags or args.set_tags or args.untag_specs or args.remap_tags or args.map_aliases:
+                        llm_dialogue_tagger.apply_cli_tag_operations(
+                            tagged_files,
+                            list_tags=args.list_tags,
+                            set_tags=args.set_tags,
+                            untag_specs=args.untag_specs,
+                            remap_tags=args.remap_tags,
+                            map_aliases=args.map_aliases,
+                        )
+                    if args.review_tags is True:
+                        llm_dialogue_tagger.interactive_review_dialogue_tags(tagged_files, force_open=True)
+                    elif args.review_tags is None and is_interactive:
+                        llm_dialogue_tagger.interactive_review_dialogue_tags(tagged_files, force_open=False)
+
                     update_manifest_file(tagged_files)
                     print(f"\n[✓] Updated manifest '{MANIFEST_FILE}' to point to {len(tagged_files)} tagged chapter(s).")
                     print("[✓] Voice mappings synchronized in 'tag_mappings.json' and 'characters.json'.")

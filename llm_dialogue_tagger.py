@@ -815,6 +815,703 @@ def update_manifest_file(new_files, manifest_file=MANIFEST_FILE):
     return final_list
 
 
+# ==================== DIALOGUE TAG REVIEW & EDITING ====================
+
+DIALOGUE_TAG_REGEX = re.compile(
+    r"\[\s*([a-zA-Z0-9_\'\-]+)(?::([a-zA-Z0-9_\'\-]+))?\s*\]\s*(.*?)\s*\[\s*/\s*\1(?::[a-zA-Z0-9_\'\-]+)?\s*\]",
+    re.DOTALL | re.IGNORECASE,
+)
+
+
+def _parse_index_selection(input_str, max_idx):
+    """Parses 1-based indices/ranges ('1, 3, 5-7', 'all') into a sorted list of ints."""
+    raw = str(input_str or "").strip()
+    if not raw:
+        return []
+    if raw.lower() == "all":
+        return list(range(1, max_idx + 1))
+
+    selected = set()
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            bounds = part.split("-", 1)
+            try:
+                start, end = int(bounds[0].strip()), int(bounds[1].strip())
+                for n in range(min(start, end), max(start, end) + 1):
+                    if 1 <= n <= max_idx:
+                        selected.add(n)
+            except ValueError:
+                pass
+        else:
+            try:
+                n = int(part)
+                if 1 <= n <= max_idx:
+                    selected.add(n)
+            except ValueError:
+                pass
+    return sorted(selected)
+
+
+def _strip_tag_markers(snippet):
+    """Strips [Speaker] ... [/Speaker] wrappers for readable paragraph context."""
+    return DIALOGUE_TAG_REGEX.sub(lambda m: m.group(3).strip(), snippet)
+
+
+def extract_dialogue_tags(text):
+    """
+    Extracts every tagged dialogue span (`[Speaker] ... [/Speaker]` or `[Speaker:tone] ... [/Speaker:tone]`)
+    from `text` along with 1-based index, character offsets, line number, and surrounding context.
+    """
+    tags = []
+    for idx, match in enumerate(DIALOGUE_TAG_REGEX.finditer(text), 1):
+        start, end = match.span()
+        speaker = match.group(1).strip()
+        emotion = (match.group(2) or "").strip()
+        dialogue = match.group(3).strip()
+        line_num = text.count("\n", 0, start) + 1
+
+        p_start = text.rfind("\n\n", 0, start)
+        p_start = 0 if p_start == -1 else p_start + 2
+        p_end = text.find("\n\n", end)
+        if p_end == -1:
+            p_end = len(text)
+
+        before_clean = _strip_tag_markers(text[p_start:start]).replace("\n", " ").strip()
+        after_clean = _strip_tag_markers(text[end:p_end]).replace("\n", " ").strip()
+        dlg_clean = dialogue.replace("\n", " ").strip()
+        full_paragraph = " ".join(p for p in (before_clean, f"» {dlg_clean} «", after_clean) if p)
+
+        pre_snippet = before_clean[-45:] if len(before_clean) > 45 else before_clean
+        if len(before_clean) > 45:
+            pre_snippet = "..." + pre_snippet
+        post_snippet = after_clean[:55] + "..." if len(after_clean) > 55 else after_clean
+        short_dlg = dlg_clean if len(dlg_clean) <= 50 else dlg_clean[:47] + "..."
+        context = " ".join(p for p in (pre_snippet, f"» {short_dlg} «", post_snippet) if p)
+
+        tags.append({
+            "index": idx,
+            "start": start,
+            "end": end,
+            "speaker": speaker,
+            "emotion": emotion,
+            "dialogue": dialogue,
+            "line_num": line_num,
+            "context": context,
+            "paragraph": full_paragraph,
+        })
+    return tags
+
+
+def _resolve_character_display(speaker, roster=None, chars_cfg=None):
+    """Returns canonical character name and voice summary if configured."""
+    low = speaker.strip().lower()
+    canon = roster.get(low, speaker) if roster else speaker
+    if chars_cfg:
+        cfg = chars_cfg.get(canon.lower()) or chars_cfg.get(low)
+        if isinstance(cfg, dict):
+            eng = cfg.get("engine", "kokoro").upper()
+            v = cfg.get("ref_audio") if eng in ("F5TTS", "F5-TTS") else cfg.get("voice", "")
+            return canon, f"{eng}: {os.path.basename(v) if eng in ('F5TTS', 'F5-TTS') and v else v}"
+    return canon, ""
+
+
+def format_dialogue_tags_report(
+    text,
+    file_label="",
+    filter_char=None,
+    index_range=None,
+    roster=None,
+    chars_cfg=None,
+    limit=None,
+    offset=0,
+):
+    """Formats a readable report of dialogue tags and character summary in `text`."""
+    tags = extract_dialogue_tags(text)
+    if not tags:
+        return f"  (No dialogue tags found in {file_label or 'file'}.)"
+
+    if roster is None:
+        roster = load_canonical_roster()
+    if chars_cfg is None and os.path.exists(CHARACTERS_FILE):
+        try:
+            with open(CHARACTERS_FILE, "r", encoding="utf-8") as f:
+                raw_c = json.load(f)
+            chars_cfg = {k.lower(): v for k, v in raw_c.items() if isinstance(v, dict)}
+        except Exception:
+            chars_cfg = {}
+
+    counts = {}
+    for t in tags:
+        lbl = f"{t['speaker']}:{t['emotion']}" if t["emotion"] else t["speaker"]
+        counts[lbl] = counts.get(lbl, 0) + 1
+
+    lines = []
+    if file_label:
+        lines.append("=" * 78)
+        lines.append(f" Dialogue Tags: {file_label} ({len(tags)} tag(s))")
+        lines.append("=" * 78)
+
+    lines.append(" Speaker summary:")
+    for lbl, cnt in sorted(counts.items(), key=lambda x: (-x[1], x[0].lower())):
+        base_spk = lbl.split(":", 1)[0]
+        canon, v_info = _resolve_character_display(base_spk, roster=roster, chars_cfg=chars_cfg)
+        alias_note = f" -> {canon}" if canon.lower() != base_spk.lower() else ""
+        voice_note = f" [{v_info}]" if v_info else ""
+        lines.append(f"   • {lbl:<20} : {cnt:3d} line(s){alias_note}{voice_note}")
+
+    filtered = tags
+    if filter_char:
+        fc_low = filter_char.strip().lower()
+        filtered = [t for t in filtered if fc_low in t["speaker"].lower() or fc_low in t["emotion"].lower()]
+    if index_range:
+        idx_set = set(index_range)
+        filtered = [t for t in filtered if t["index"] in idx_set]
+
+    total_filtered = len(filtered)
+    if offset:
+        filtered = filtered[offset:]
+    if limit is not None and limit > 0:
+        filtered = filtered[:limit]
+
+    lines.append("-" * 78)
+    if not filtered:
+        lines.append(" (No matching dialogue tags for current filter.)")
+    else:
+        for t in filtered:
+            tag_lbl = f"{t['speaker']}:{t['emotion']}" if t["emotion"] else t["speaker"]
+            lines.append(f"  [{t['index']:03d}] [{tag_lbl:<20}] {t['context']}")
+        if limit is not None and (offset + len(filtered)) < total_filtered:
+            lines.append(f"  ... showing {offset + 1}-{offset + len(filtered)} of {total_filtered} matching tag(s).")
+    lines.append("=" * 78)
+    return "\n".join(lines)
+
+
+def apply_dialogue_tag_edits(text, index_edits=None, remap_rules=None):
+    """
+    Applies index-specific edits and/or speaker remap rules to tagged dialogue spans in `text`.
+    - `index_edits`: dict[int, dict(action='set'|'untag', speaker=str|None, emotion=str|None)]
+    - `remap_rules`: list of (old_speaker, new_speaker, new_emotion_or_none)
+    Returns `(updated_text, changes_log, remaining_speakers)`.
+    """
+    tags = extract_dialogue_tags(text)
+    if not tags:
+        return text, [], set()
+
+    remap_map = {}
+    for rule in (remap_rules or []):
+        old_spk, new_spk, new_emo = rule
+        remap_map[old_spk.strip().lower()] = (new_spk.strip(), new_emo)
+
+    updated = text
+    changes = []
+    remaining_speakers = set()
+
+    for tag in reversed(tags):
+        idx = tag["index"]
+        orig_spk = tag["speaker"]
+        orig_emo = tag["emotion"]
+        orig_lbl = f"{orig_spk}:{orig_emo}" if orig_emo else orig_spk
+
+        edit = (index_edits or {}).get(idx)
+        remap = remap_map.get(orig_spk.lower()) if edit is None else None
+
+        if edit is None and remap is None:
+            remaining_speakers.add(orig_spk)
+            continue
+
+        if edit is not None:
+            action = edit.get("action", "set")
+            new_spk = edit.get("speaker")
+            new_emo = edit.get("emotion")
+        else:
+            new_spk, new_emo = remap
+            action = "untag" if new_spk.lower() in ("untag", "narrator", "none") else "set"
+
+        if action == "untag" or (new_spk is not None and new_spk.lower() in ("untag", "narrator", "none")):
+            replacement = tag["dialogue"]
+            changes.append(f"#{idx:03d}: [{orig_lbl}] -> UNTAGGED (narrator)")
+        else:
+            final_spk = new_spk if new_spk else orig_spk
+            if new_emo is None:
+                final_emo = orig_emo
+            elif new_emo.lower() in ("", "none", "clear", "-"):
+                final_emo = ""
+            else:
+                final_emo = new_emo.strip().lower()
+
+            if final_emo:
+                replacement = f"[{final_spk}:{final_emo}] {tag['dialogue']} [/{final_spk}:{final_emo}]"
+                new_lbl = f"{final_spk}:{final_emo}"
+            else:
+                replacement = f"[{final_spk}] {tag['dialogue']} [/{final_spk}]"
+                new_lbl = final_spk
+
+            remaining_speakers.add(final_spk)
+            if new_lbl != orig_lbl:
+                changes.append(f"#{idx:03d}: [{orig_lbl}] -> [{new_lbl}]")
+
+        updated = updated[:tag["start"]] + replacement + updated[tag["end"]:]
+
+    changes.reverse()
+    return updated, changes, remaining_speakers
+
+
+def invalidate_cached_audio_for_chapter(tagged_file_path):
+    """
+    Removes stale chapter audio chunks, merged MP3, and timestamps if a tagged chapter
+    was modified after audio was already generated.
+    """
+    import shutil
+
+    base_name = os.path.splitext(os.path.basename(tagged_file_path))[0]
+    parent_dir = os.path.basename(os.path.dirname(tagged_file_path))
+    if parent_dir and parent_dir.lower() not in ("parsed_chapters", "tagged_chapters", "raw_txt", ".", ""):
+        book_title_base = parent_dir
+    else:
+        cleaned_first = re.sub(r"^\d+_", "", base_name)
+        book_title_base = re.sub(r"^intro_", "", cleaned_first)
+
+    folder_name = f"{book_title_base}_hybrid_audiobook_output"
+    removed = []
+    for candidate_dir in (folder_name, os.path.join("finished", folder_name)):
+        if not os.path.exists(candidate_dir):
+            continue
+        for fname in (f"{base_name}_complete.mp3", f"{base_name}_timestamps.txt"):
+            fpath = os.path.join(candidate_dir, fname)
+            if os.path.exists(fpath):
+                try:
+                    os.remove(fpath)
+                    removed.append(fpath)
+                except Exception:
+                    pass
+        chunk_dir = os.path.join(candidate_dir, f"chunks_{base_name}")
+        if os.path.exists(chunk_dir):
+            try:
+                shutil.rmtree(chunk_dir)
+                removed.append(chunk_dir)
+            except Exception:
+                pass
+    return removed
+
+
+def _resolve_target_file_indices(chap_selector, file_paths):
+    """Resolves a chapter selector ('1', '1-2', or basename substring) into 0-based indices into `file_paths`."""
+    if not chap_selector:
+        return list(range(len(file_paths)))
+    sel = chap_selector.strip()
+    indices = _parse_index_selection(sel, len(file_paths))
+    if indices:
+        return [i - 1 for i in indices]
+    sel_low = sel.lower()
+    return [i for i, p in enumerate(file_paths) if sel_low in os.path.basename(p).lower()]
+
+
+def _parse_single_tag_target(rhs):
+    """Parses '<Speaker>[:<emotion>]', ':<emotion>', or 'untag' into (action, speaker, emotion)."""
+    rhs = rhs.strip()
+    if rhs.lower() in ("untag", "narrator", "none", "-"):
+        return "untag", "untag", None
+    if ":" in rhs:
+        spk_part, emo_part = rhs.split(":", 1)
+        spk = spk_part.strip() or None
+        emo_raw = emo_part.strip().lower()
+        emo = "" if emo_raw in ("", "none", "clear", "-") else emo_raw
+        return "set", spk, emo
+    return "set", rhs, None
+
+
+def parse_tag_edit_specs(set_tag_specs=None, untag_specs=None, remap_specs=None, file_paths=None):
+    """
+    Parses CLI tag edit arguments into per-file `index_edits` and `remap_rules`.
+    Supported formats:
+      - set_tag: '[<chap>:]<indices>=<Speaker>[:<emotion>]' or '1=Alice; 2,4-6=Bob:whisper; 7=untag'
+      - untag:   '[<chap>:]<indices>'
+      - remap:   '<OldSpeaker>=<NewSpeaker>[:<emotion>]' or '<OldSpeaker>=untag'
+    """
+    file_paths = file_paths or []
+    per_file_edits = {i: {} for i in range(len(file_paths))}
+    remap_rules = []
+
+    def _split_semicolon(items):
+        out = []
+        for item in (items or []):
+            for piece in str(item).split(";"):
+                piece = piece.strip()
+                if piece:
+                    out.append(piece)
+        return out
+
+    for spec in _split_semicolon(set_tag_specs):
+        if "=" not in spec:
+            print(f"[!] Ignoring invalid --set-tag spec '{spec}' (expected '<indices>=<Speaker>[:<emotion>]').")
+            continue
+        lhs, rhs = spec.split("=", 1)
+        lhs = lhs.strip()
+        if ":" in lhs:
+            chap_sel, idx_sel = lhs.split(":", 1)
+            target_f_indices = _resolve_target_file_indices(chap_sel, file_paths)
+        else:
+            idx_sel = lhs
+            target_f_indices = list(range(len(file_paths)))
+
+        action, spk, emo = _parse_single_tag_target(rhs)
+        for fi in target_f_indices:
+            fpath = file_paths[fi]
+            if not os.path.exists(fpath):
+                continue
+            with open(fpath, "r", encoding="utf-8") as f:
+                tag_count = len(extract_dialogue_tags(f.read()))
+            for tidx in _parse_index_selection(idx_sel, tag_count):
+                per_file_edits[fi][tidx] = {"action": action, "speaker": spk, "emotion": emo}
+
+    for spec in _split_semicolon(untag_specs):
+        if ":" in spec:
+            chap_sel, idx_sel = spec.split(":", 1)
+            target_f_indices = _resolve_target_file_indices(chap_sel, file_paths)
+        else:
+            idx_sel = spec
+            target_f_indices = list(range(len(file_paths)))
+        for fi in target_f_indices:
+            fpath = file_paths[fi]
+            if not os.path.exists(fpath):
+                continue
+            with open(fpath, "r", encoding="utf-8") as f:
+                tag_count = len(extract_dialogue_tags(f.read()))
+            for tidx in _parse_index_selection(idx_sel, tag_count):
+                per_file_edits[fi][tidx] = {"action": "untag", "speaker": "untag", "emotion": None}
+
+    for spec in _split_semicolon(remap_specs):
+        if "=" not in spec:
+            print(f"[!] Ignoring invalid --remap-tag spec '{spec}' (expected '<OldSpeaker>=<NewSpeaker>[:<emotion>]').")
+            continue
+        old_spk, rhs = spec.split("=", 1)
+        old_spk = old_spk.strip()
+        _, new_spk, new_emo = _parse_single_tag_target(rhs)
+        if old_spk and new_spk:
+            remap_rules.append((old_spk, new_spk, new_emo))
+
+    return per_file_edits, remap_rules
+
+
+def apply_cli_tag_operations(
+    file_paths,
+    list_tags=False,
+    set_tags=None,
+    untag_specs=None,
+    remap_tags=None,
+    map_aliases=None,
+    filter_char=None,
+):
+    """
+    Applies non-interactive CLI dialogue tag operations (alias mapping, speaker remapping,
+    per-index tag changes, untagging, and tag listing) across `file_paths`.
+    Returns True if any file was modified.
+    """
+    any_modified = False
+
+    if map_aliases:
+        ensure_tag_mappings_file()
+        try:
+            with open(TAG_MAPPINGS_FILE, "r", encoding="utf-8") as f:
+                mappings = json.load(f)
+        except Exception:
+            mappings = {}
+        for item in map_aliases:
+            for piece in str(item).split(";"):
+                piece = piece.strip()
+                if "=" not in piece:
+                    continue
+                alias, canon = [p.strip() for p in piece.split("=", 1)]
+                if alias and canon:
+                    mappings[alias.lower()] = canon
+                    print(f"[✓] Mapped alias '{alias.lower()}' -> '{canon}' in '{TAG_MAPPINGS_FILE}'.")
+        with open(TAG_MAPPINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(mappings, f, indent=4)
+
+    has_edits = bool(set_tags or untag_specs or remap_tags)
+    if has_edits and file_paths:
+        per_file_edits, remap_rules = parse_tag_edit_specs(
+            set_tag_specs=set_tags,
+            untag_specs=untag_specs,
+            remap_specs=remap_tags,
+            file_paths=file_paths,
+        )
+        all_new_speakers = set()
+        for fi, fpath in enumerate(file_paths):
+            if not os.path.exists(fpath):
+                continue
+            edits = per_file_edits.get(fi, {})
+            if not edits and not remap_rules:
+                continue
+            with open(fpath, "r", encoding="utf-8") as f:
+                orig_text = f.read()
+            new_text, changes, used_speakers = apply_dialogue_tag_edits(
+                orig_text, index_edits=edits, remap_rules=remap_rules
+            )
+            if changes and new_text != orig_text:
+                with open(fpath, "w", encoding="utf-8") as f:
+                    f.write(new_text)
+                invalidate_cached_audio_for_chapter(fpath)
+                all_new_speakers.update(used_speakers)
+                any_modified = True
+                print(f"[✓] Updated {len(changes)} dialogue tag(s) in '{fpath}':")
+                for ch in changes:
+                    print(f"    • {ch}")
+
+        if all_new_speakers:
+            sync_tag_mappings(all_new_speakers)
+            sync_characters_json(all_new_speakers)
+
+    if list_tags:
+        found_any = False
+        for idx, fpath in enumerate(file_paths or [], 1):
+            if not os.path.exists(fpath):
+                continue
+            with open(fpath, "r", encoding="utf-8") as f:
+                text = f.read()
+            if extract_dialogue_tags(text):
+                found_any = True
+                print("\n" + format_dialogue_tags_report(
+                    text,
+                    file_label=f"[{idx}] {fpath}",
+                    filter_char=filter_char,
+                ))
+        if not found_any:
+            print("[*] No dialogue tags found in the selected file(s).")
+
+    return any_modified
+
+
+def _prompt_pick_speaker(known_speakers):
+    """Interactive speaker picker for dialogue tag editing."""
+    sorted_spks = sorted({s for s in known_speakers if s and s.lower() not in ("narrator", "divider", "unknown")}, key=str.lower)
+    print("\nKnown Characters:")
+    for idx, spk in enumerate(sorted_spks, 1):
+        print(f"  [{idx:2d}] {spk}")
+    print("  [ 0] Enter a new/custom character name")
+    print("  [ u] Untag (read by Narrator)")
+
+    sel = input(f"Select speaker [0-{len(sorted_spks)} or 'u' or type name]: ").strip()
+    if not sel:
+        return None
+    if sel.lower() in ("u", "untag", "narrator"):
+        return "untag"
+    try:
+        num = int(sel)
+        if num == 0:
+            custom = input("Enter character name: ").strip()
+            return clean_character_name(custom) if custom else None
+        if 1 <= num <= len(sorted_spks):
+            return sorted_spks[num - 1]
+    except ValueError:
+        return clean_character_name(sel)
+    return None
+
+
+def interactive_review_dialogue_tags(file_paths, force_open=False):
+    """
+    Interactively inspects and edits dialogue tags across tagged files when applicable.
+    Automatically skips files containing 0 dialogue tags (e.g. intro or untagged chapters).
+    Returns True if any tags were modified.
+    """
+    reviewable = []
+    for fpath in (file_paths or []):
+        if not os.path.exists(fpath):
+            continue
+        with open(fpath, "r", encoding="utf-8") as f:
+            text = f.read()
+        tags = extract_dialogue_tags(text)
+        if tags:
+            reviewable.append((fpath, len(tags)))
+
+    if not reviewable:
+        print("[*] No dialogue tags found in processed file(s); skipping dialogue tag review.")
+        return False
+
+    total_tags = sum(cnt for _, cnt in reviewable)
+    print("\n" + "=" * 70)
+    print(f"             Dialogue Tag Review ({total_tags} tag(s) across {len(reviewable)} file(s))")
+    print("=" * 70)
+    for idx, (fpath, cnt) in enumerate(reviewable, 1):
+        print(f"  [{idx:2d}] {fpath} ({cnt} dialogue tag(s))")
+
+    if not force_open:
+        ans = input("\nDo you want to review or change any dialogue tags? [y/N] (default 'n'): ").strip().lower()
+        if ans not in ("y", "yes"):
+            return False
+
+    any_modified = False
+    roster = load_canonical_roster()
+    known_emotions = sorted(EMOTION_KEYWORDS.keys())
+
+    while True:
+        if len(reviewable) == 1:
+            file_idx = 0
+        else:
+            print("\nSelect a file to review dialogue tags:")
+            for idx, (fpath, _) in enumerate(reviewable, 1):
+                with open(fpath, "r", encoding="utf-8") as f:
+                    cur_cnt = len(extract_dialogue_tags(f.read()))
+                print(f"  [{idx:2d}] {fpath} ({cur_cnt} tag(s))")
+            print("  [ 0] Done / Continue")
+            f_sel = input(f"Select file [0-{len(reviewable)}] (default 0): ").strip()
+            if not f_sel or f_sel == "0":
+                break
+            try:
+                fi = int(f_sel)
+                if not (1 <= fi <= len(reviewable)):
+                    print("[-] Invalid selection.")
+                    continue
+                file_idx = fi - 1
+            except ValueError:
+                print("[-] Invalid number.")
+                continue
+
+        target_path = reviewable[file_idx][0]
+        filter_char = None
+        page_offset = 0
+        page_size = 40
+
+        while True:
+            with open(target_path, "r", encoding="utf-8") as f:
+                current_text = f.read()
+            tags = extract_dialogue_tags(current_text)
+            if not tags:
+                print(f"[*] All dialogue tags in '{target_path}' were removed.")
+                break
+
+            print("\n" + format_dialogue_tags_report(
+                current_text,
+                file_label=target_path,
+                filter_char=filter_char,
+                roster=roster,
+                limit=page_size,
+                offset=page_offset,
+            ))
+            print("Commands:")
+            print("  • Enter tag number(s) to edit (e.g. '3', '1, 4-6', 'all')")
+            print("  • Or quick edit inline: '3=Alice', '2,5=Bob:whisper', '4=untag', '3=:none'")
+            print("  • [f <name>] Filter by character | [f all] Clear filter | [n/p] Next/Prev page")
+            print("  • [r] Bulk remap a speaker | [m] Map alias in tag_mappings.json | [Enter/q] Done")
+
+            cmd = input("\nTag review > ").strip()
+            if not cmd or cmd.lower() in ("q", "quit", "done", "d"):
+                break
+
+            if cmd.lower() == "n":
+                page_offset += page_size
+                continue
+            if cmd.lower() == "p":
+                page_offset = max(0, page_offset - page_size)
+                continue
+            if cmd.lower() == "a":
+                page_size = None
+                page_offset = 0
+                continue
+            if cmd.lower().startswith("f "):
+                arg_f = cmd[2:].strip()
+                filter_char = None if arg_f.lower() in ("", "all", "clear") else arg_f
+                page_offset = 0
+                continue
+
+            if cmd.lower() == "m":
+                alias_in = input("Enter alias=CanonicalName (e.g. bobby=Bob): ").strip()
+                if "=" in alias_in:
+                    apply_cli_tag_operations([target_path], map_aliases=[alias_in])
+                    roster = load_canonical_roster()
+                continue
+
+            if cmd.lower() == "r":
+                old_s = input("Speaker tag to replace (exact name): ").strip()
+                if not old_s:
+                    continue
+                new_s = input(f"Replace all [{old_s}] with (character name, 'Speaker:emotion', or 'untag'): ").strip()
+                if not new_s:
+                    continue
+                if apply_cli_tag_operations([target_path], remap_tags=[f"{old_s}={new_s}"]):
+                    any_modified = True
+                    roster = load_canonical_roster()
+                continue
+
+            if "=" in cmd:
+                if apply_cli_tag_operations([target_path], set_tags=[cmd]):
+                    any_modified = True
+                    roster = load_canonical_roster()
+                continue
+
+            selected_indices = _parse_index_selection(cmd, len(tags))
+            if not selected_indices:
+                print("[-] Unrecognized command or tag index.")
+                continue
+
+            print("\nSelected tag(s):")
+            for tidx in selected_indices[:10]:
+                t = tags[tidx - 1]
+                lbl = f"{t['speaker']}:{t['emotion']}" if t["emotion"] else t["speaker"]
+                print(f"  [{tidx:03d}] [{lbl}] {t['paragraph']}")
+            if len(selected_indices) > 10:
+                print(f"  ... and {len(selected_indices) - 10} more.")
+
+            print("\nEdit Action:")
+            print("  [1] Change speaker (and optionally emotion/variant)")
+            print("  [2] Change or clear emotion / tone / alt variant")
+            print("  [3] Untag quote (remove tag so Narrator reads it)")
+            print("  [0] Cancel")
+            act = input("Select action [0-3]: ").strip()
+
+            index_edits = {}
+            if act == "1":
+                known_spks = set(roster.values()) | {t["speaker"] for t in tags}
+                chosen_spk = _prompt_pick_speaker(known_spks)
+                if not chosen_spk:
+                    continue
+                if chosen_spk == "untag":
+                    for tidx in selected_indices:
+                        index_edits[tidx] = {"action": "untag", "speaker": "untag", "emotion": None}
+                else:
+                    emo_in = input(
+                        f"Optional emotion/alt ({', '.join(known_emotions)}, 'none' to clear, Enter to keep): "
+                    ).strip().lower()
+                    emo_val = None if not emo_in else ("" if emo_in in ("none", "clear", "-") else emo_in)
+                    for tidx in selected_indices:
+                        index_edits[tidx] = {"action": "set", "speaker": chosen_spk, "emotion": emo_val}
+            elif act == "2":
+                emo_in = input(
+                    f"Enter emotion/alt ({', '.join(known_emotions)}, or 'none' to clear): "
+                ).strip().lower()
+                if not emo_in:
+                    continue
+                emo_val = "" if emo_in in ("none", "clear", "-") else emo_in
+                for tidx in selected_indices:
+                    index_edits[tidx] = {"action": "set", "speaker": None, "emotion": emo_val}
+            elif act == "3":
+                for tidx in selected_indices:
+                    index_edits[tidx] = {"action": "untag", "speaker": "untag", "emotion": None}
+            else:
+                continue
+
+            new_text, changes, used_speakers = apply_dialogue_tag_edits(current_text, index_edits=index_edits)
+            if changes and new_text != current_text:
+                with open(target_path, "w", encoding="utf-8") as f:
+                    f.write(new_text)
+                invalidate_cached_audio_for_chapter(target_path)
+                sync_tag_mappings(used_speakers)
+                sync_characters_json(used_speakers)
+                roster = load_canonical_roster()
+                any_modified = True
+                print(f"[✓] Applied {len(changes)} change(s) to '{target_path}':")
+                for ch in changes[:10]:
+                    print(f"    • {ch}")
+
+        if len(reviewable) == 1:
+            break
+
+    return any_modified
+
+
 # ==================== INTERACTIVE CLI ====================
 
 def select_input_files():
@@ -862,28 +1559,129 @@ def select_input_files():
     return [candidates[0]]
 
 
+def _resolve_existing_tagged_files(target_input=None):
+    """Resolves existing tagged files from `--input` or `chapters.txt` / `tagged_chapters/` for review-only mode."""
+    if target_input:
+        if target_input.lower() == "all" and os.path.exists(MANIFEST_FILE):
+            with open(MANIFEST_FILE, "r", encoding="utf-8") as mf:
+                files = [l.strip() for l in mf if l.strip() and not l.startswith("#")]
+        elif os.path.isdir(target_input):
+            files = sorted(glob.glob(os.path.join(target_input, "**", "*.txt"), recursive=True))
+        elif os.path.exists(target_input):
+            files = [target_input]
+        else:
+            files = []
+    elif os.path.exists(MANIFEST_FILE):
+        with open(MANIFEST_FILE, "r", encoding="utf-8") as mf:
+            files = [l.strip() for l in mf if l.strip() and not l.startswith("#")]
+    else:
+        files = sorted(glob.glob(os.path.join(DEFAULT_OUTPUT_DIR, "**", "*.txt"), recursive=True))
+
+    resolved = []
+    for f in files:
+        if "parsed_chapters" in os.path.normpath(f).split(os.sep):
+            parts = os.path.normpath(f).split(os.sep)
+            p_idx = parts.index("parsed_chapters")
+            candidate = os.path.join(DEFAULT_OUTPUT_DIR, *parts[p_idx + 1:])
+            if os.path.exists(candidate):
+                resolved.append(candidate)
+                continue
+        if os.path.exists(f):
+            resolved.append(f)
+    return resolved
+
+
 def main():
     print("=" * 70)
     print("      Fast & Accurate Audiobook Dialogue Tagger & Voice Mapper    ")
     print("=" * 70)
 
     parser = argparse.ArgumentParser(description="Tag spoken dialogue using fast smart context attribution or hybrid LLM.")
-    parser.add_argument("--input", "-i", type=str, help="Path to input text file or 'all' to tag chapters in chapters.txt.")
-    parser.add_argument("--format", "-f", choices=["prose", "hybrid", "script"], help="Tagging mode: 'prose' (fast smart engine), 'hybrid' (+ GPU LLM), or 'script'.")
+    parser.add_argument("input_pos", nargs="?", default=None, help="Optional input text file, folder, or 'all' (manifest).")
+    parser.add_argument("--input", "-i", type=str, default=None, help="Path to input text file or 'all' to tag chapters in chapters.txt.")
+    parser.add_argument(
+        "--format", "-f", "--tag-mode",
+        dest="format",
+        choices=["fast", "prose", "hybrid", "script"],
+        default=None,
+        help="Tagging mode: 'fast'/'prose' (smart engine), 'hybrid' (+ GPU LLM), or 'script'.",
+    )
     parser.add_argument("--model", "-m", type=str, default=DEFAULT_MODEL, help="Ollama model name (default: qwen2.5:7b).")
     parser.add_argument("--url", "-u", type=str, default=DEFAULT_OLLAMA_URL, help="Ollama server URL.")
-    parser.add_argument("--output", "-o", type=str, help="Destination directory or file path for tagged text.")
-    parser.add_argument("--detect-tone", action="store_true", help="Detect dialogue emotions (whisper, shout, angry, etc.) and tag as [Speaker:tone].")
+    parser.add_argument("--output", "-o", type=str, default=None, help="Destination directory for tagged text.")
+    parser.add_argument("--detect-tone", "--emotions", dest="detect_tone", action="store_true", default=None, help="Detect dialogue emotions and tag as [Speaker:tone].")
+    parser.add_argument("--no-detect-tone", "--no-emotions", dest="detect_tone", action="store_false", help="Disable dialogue emotion/tone detection.")
+    parser.add_argument("--update-manifest", dest="update_manifest", action="store_true", default=None, help="Update chapters.txt with tagged files.")
+    parser.add_argument("--no-update-manifest", dest="update_manifest", action="store_false", help="Do not modify chapters.txt.")
+    parser.add_argument("--review-tags", "--review", dest="review_tags", action="store_true", default=None, help="Interactively review and edit dialogue tags after tagging.")
+    parser.add_argument("--no-review-tags", dest="review_tags", action="store_false", help="Skip interactive dialogue tag review prompt.")
+    parser.add_argument("--review-only", action="store_true", default=False, help="Review/edit existing tagged files without re-running attribution.")
+    parser.add_argument("--list-tags", "--show-tags", action="store_true", default=False, help="Print numbered dialogue tags and context for selected file(s).")
+    parser.add_argument("--filter-char", type=str, default=None, help="Filter --list-tags output by speaker/emotion name.")
+    parser.add_argument("--set-tag", "--change-tag", "--edit-tag", dest="set_tags", action="append", default=[], help="Change tag(s), e.g. '1=Alice' or '2,4-6=Bob:whisper' or '1:3=untag'.")
+    parser.add_argument("--untag", dest="untag_specs", action="append", default=[], help="Remove dialogue tags so Narrator reads them, e.g. '3,5' or '1:3,5'.")
+    parser.add_argument("--remap-tag", "--rename-tag", dest="remap_tags", action="append", default=[], help="Bulk remap a speaker tag, e.g. 'OldName=NewName' or 'OldName=untag'.")
+    parser.add_argument("--map-alias", dest="map_aliases", action="append", default=[], help="Map tag alias in tag_mappings.json, e.g. 'bobby=Bob'.")
+    parser.add_argument("--interactive", action="store_true", default=False, help="Prompt interactively for unspecified options.")
+    parser.add_argument("--yes", "-y", "--non-interactive", dest="non_interactive", action="store_true", default=False, help="Run non-interactively with defaults for unspecified options.")
     args = parser.parse_args()
 
+    input_arg = args.input or args.input_pos
+    has_cli_flags = len(sys.argv) > 1
+    is_interactive = args.interactive or (not has_cli_flags and not args.non_interactive)
+
+    # Review / Edit-only shortcut for already-tagged files
+    edit_only_mode = args.review_only or (
+        (args.list_tags or args.set_tags or args.untag_specs or args.remap_tags or args.map_aliases)
+        and args.format is None
+        and (not input_arg or os.path.normpath(input_arg).startswith(os.path.normpath(DEFAULT_OUTPUT_DIR)) or input_arg.lower() == "all")
+    )
+    if edit_only_mode:
+        target_files = _resolve_existing_tagged_files(input_arg)
+        if not target_files:
+            print("[!] No existing tagged files found to inspect or edit.")
+            return
+        if args.list_tags or args.set_tags or args.untag_specs or args.remap_tags or args.map_aliases:
+            apply_cli_tag_operations(
+                target_files,
+                list_tags=args.list_tags,
+                set_tags=args.set_tags,
+                untag_specs=args.untag_specs,
+                remap_tags=args.remap_tags,
+                map_aliases=args.map_aliases,
+                filter_char=args.filter_char,
+            )
+        has_cli_edit_ops = bool(args.list_tags or args.set_tags or args.untag_specs or args.remap_tags or args.map_aliases)
+        should_open_interactive = (
+            args.review_tags is True
+            or (
+                args.review_only
+                and args.review_tags is not False
+                and not args.non_interactive
+                and (args.interactive or not has_cli_edit_ops)
+            )
+        )
+        if should_open_interactive:
+            interactive_review_dialogue_tags(target_files, force_open=True)
+        return
+
     # 1. Determine files to process
-    if args.input and args.input.lower() == "all" and os.path.exists(MANIFEST_FILE):
+    if input_arg and input_arg.lower() == "all" and os.path.exists(MANIFEST_FILE):
         with open(MANIFEST_FILE, "r", encoding="utf-8") as mf:
             files_to_process = [line.strip() for line in mf if line.strip() and not line.startswith("#")]
-    elif args.input and os.path.exists(args.input):
-        files_to_process = [args.input]
+    elif input_arg and os.path.isdir(input_arg):
+        files_to_process = sorted(glob.glob(os.path.join(input_arg, "**", "*.txt"), recursive=True))
+    elif input_arg and os.path.exists(input_arg):
+        files_to_process = [input_arg]
+    elif not is_interactive and os.path.exists(MANIFEST_FILE):
+        with open(MANIFEST_FILE, "r", encoding="utf-8") as mf:
+            files_to_process = [line.strip() for line in mf if line.strip() and not line.startswith("#")]
     else:
         files_to_process = select_input_files()
+
+    if not files_to_process:
+        print("[!] No input files found to tag.")
+        return
 
     print(f"\n[+] Files to process: {len(files_to_process)}")
     for f in files_to_process:
@@ -891,16 +1689,21 @@ def main():
 
     # 2. Select Dialogue Format / Mode
     dialogue_format = args.format
+    if dialogue_format == "fast":
+        dialogue_format = "prose"
     if not dialogue_format:
-        print("\nSelect dialogue tagging mode:")
-        print("  [1] Fast Smart Parser (Instant, 100% quote coverage, zero GPU wait) [Recommended]")
-        print("  [2] Hybrid LLM (Smart Parser + Local GPU LLM verification for ambiguous dialogue)")
-        print("  [3] Script Form (Screenplay / Script format: [Name]: dialogue)")
-        fmt_choice = input("Enter choice [1, 2, or 3] (default 1): ").strip()
-        if fmt_choice == "2":
-            dialogue_format = "hybrid"
-        elif fmt_choice == "3":
-            dialogue_format = "script"
+        if is_interactive:
+            print("\nSelect dialogue tagging mode:")
+            print("  [1] Fast Smart Parser (Instant, 100% quote coverage, zero GPU wait) [Recommended]")
+            print("  [2] Hybrid LLM (Smart Parser + Local GPU LLM verification for ambiguous dialogue)")
+            print("  [3] Script Form (Screenplay / Script format: [Name]: dialogue)")
+            fmt_choice = input("Enter choice [1, 2, or 3] (default 1): ").strip()
+            if fmt_choice == "2":
+                dialogue_format = "hybrid"
+            elif fmt_choice == "3":
+                dialogue_format = "script"
+            else:
+                dialogue_format = "prose"
         else:
             dialogue_format = "prose"
 
@@ -926,25 +1729,53 @@ def main():
 
     # 4. Check tone detection
     detect_tone = args.detect_tone
-    if not detect_tone and not args.format:
-        t_choice = input("\nDetect dialogue tone & emotions (whisper, shout, angry, sad, etc.)? [y/n] (default 'y'): ").strip().lower()
-        detect_tone = (t_choice != "n")
+    if detect_tone is None:
+        if is_interactive:
+            t_choice = input("\nDetect dialogue tone & emotions (whisper, shout, angry, sad, etc.)? [y/n] (default 'y'): ").strip().lower()
+            detect_tone = (t_choice != "n")
+        else:
+            detect_tone = True
 
     # 5. Run batch tagging
+    out_dir = args.output or DEFAULT_OUTPUT_DIR
     tagged_files = batch_tag_files(
         file_paths=files_to_process,
         dialogue_format=dialogue_format,
         model=chosen_model,
         url=ollama_url,
-        output_dir=DEFAULT_OUTPUT_DIR,
+        output_dir=out_dir,
         detect_tone=detect_tone
     )
 
-    # 5. Offer to update chapters.txt with the tagged files
+    # 6. Apply CLI tag edits / listing and/or interactive dialogue tag review when applicable
     if tagged_files:
-        print("\nManifest Update:")
-        update_manifest = input("Update 'chapters.txt' to point to these newly tagged files? [y/n] (default 'y'): ").strip().lower()
-        if update_manifest != "n":
+        if args.list_tags or args.set_tags or args.untag_specs or args.remap_tags or args.map_aliases:
+            apply_cli_tag_operations(
+                tagged_files,
+                list_tags=args.list_tags,
+                set_tags=args.set_tags,
+                untag_specs=args.untag_specs,
+                remap_tags=args.remap_tags,
+                map_aliases=args.map_aliases,
+                filter_char=args.filter_char,
+            )
+
+        if args.review_tags is True:
+            interactive_review_dialogue_tags(tagged_files, force_open=True)
+        elif args.review_tags is None and is_interactive:
+            interactive_review_dialogue_tags(tagged_files, force_open=False)
+
+    # 7. Update chapters.txt with the tagged files
+    if tagged_files:
+        do_update = args.update_manifest
+        if do_update is None:
+            if is_interactive:
+                print("\nManifest Update:")
+                update_manifest = input("Update 'chapters.txt' to point to these newly tagged files? [y/n] (default 'y'): ").strip().lower()
+                do_update = (update_manifest != "n")
+            else:
+                do_update = True
+        if do_update:
             update_manifest_file(tagged_files, MANIFEST_FILE)
             print(f"[✓] Updated '{MANIFEST_FILE}' with {len(tagged_files)} tagged file(s) (preserved all existing chapters).")
 

@@ -586,7 +586,7 @@ def split_text_into_tagged_blocks(text, default_character="narrator", characters
             continue
 
         # 2. Check for closing block tag: [/character] or [/character:emotion]
-        close_match = re.match(r"^\[\s*/\s*([a-zA-Z0-9_\-]+)(?::[a-zA-Z0-9_\-]+)?\s*\]$", raw_line)
+        close_match = re.match(r"^\[\s*/\s*([a-zA-Z0-9_\'\-]+)(?::[a-zA-Z0-9_\'\-]+)?\s*\]$", raw_line)
         if close_match:
             in_explicit_block = False
             current_char = resolve_char(default_character)
@@ -594,7 +594,7 @@ def split_text_into_tagged_blocks(text, default_character="narrator", characters
             continue
 
         # 3. Check for opening block tag: [character] or [character:emotion] alone on a line
-        open_block_match = re.match(r"^\[\s*([a-zA-Z0-9_\-]+)(?::([a-zA-Z0-9_\-]+))?\s*\]$", raw_line)
+        open_block_match = re.match(r"^\[\s*([a-zA-Z0-9_\'\-]+)(?::([a-zA-Z0-9_\'\-]+))?\s*\]$", raw_line)
         if open_block_match:
             in_explicit_block = True
             current_char = resolve_char(open_block_match.group(1))
@@ -603,7 +603,8 @@ def split_text_into_tagged_blocks(text, default_character="narrator", characters
 
         # 4. Check for embedded inline tags: e.g. Narration [Hero:whisper] "Dialogue" [/Hero] Narration
         inline_tag_pattern = re.compile(
-            r"\[\s*([a-zA-Z0-9_\-]+)(?::([a-zA-Z0-9_\-]+))?\s*\](.*?)\[\s*/\s*\1(?::[a-zA-Z0-9_\-]+)?\s*\]"
+            r"\[\s*([a-zA-Z0-9_\'\-]+)(?::([a-zA-Z0-9_\'\-]+))?\s*\](.*?)\[\s*/\s*\1(?::[a-zA-Z0-9_\'\-]+)?\s*\]",
+            re.IGNORECASE,
         )
         if not in_explicit_block and inline_tag_pattern.search(raw_line):
             pos = 0
@@ -639,7 +640,7 @@ def split_text_into_tagged_blocks(text, default_character="narrator", characters
             continue
 
         # 5. Check for single prefix tag without closing: [character:emotion] Rest of text...
-        prefix_match = re.match(r"^\[\s*([a-zA-Z0-9_\-]+)(?::([a-zA-Z0-9_\-]+))?\s*\]\s*(.*)$", raw_line)
+        prefix_match = re.match(r"^\[\s*([a-zA-Z0-9_\'\-]+)(?::([a-zA-Z0-9_\'\-]+))?\s*\]\s*(.*)$", raw_line)
         if prefix_match and not in_explicit_block:
             char_name = resolve_char(prefix_match.group(1))
             emotion = resolve_variant(char_name, prefix_match.group(2))
@@ -2241,17 +2242,294 @@ def interactive_rerecord_chunks(scan_results, master_output_dir, characters_map,
             break
 
 
+def apply_cli_volume_updates(characters_map, volume_specs, characters_file=CHARACTERS_FILE):
+    """
+    Applies non-interactive volume multiplier updates from specs like:
+      'Alice=1.2', 'Bob:shout=0.85', 'narrator=1.0'
+    Returns updated characters_map.
+    """
+    if not volume_specs:
+        return characters_map
+
+    for item in volume_specs:
+        for piece in re.split(r"[;,]", str(item)):
+            piece = piece.strip()
+            if not piece or "=" not in piece:
+                continue
+            target, val_str = [p.strip() for p in piece.split("=", 1)]
+            try:
+                new_vol = float(val_str)
+                if new_vol <= 0:
+                    safe_print(f"[-] Volume must be positive (ignored '{piece}').")
+                    continue
+            except ValueError:
+                safe_print(f"[-] Invalid volume number in '{piece}'.")
+                continue
+
+            if ":" in target:
+                char_key, var_name = [p.strip() for p in target.split(":", 1)]
+            else:
+                char_key, var_name = target, None
+
+            if save_characters_volume_update(char_key, new_vol, variant_name=var_name, characters_file=characters_file):
+                lbl = f"{char_key}:{var_name}" if var_name else char_key
+                safe_print(f"[OK] Updated volume={new_vol:.2f}x for [{lbl}] in '{characters_file}'.")
+            else:
+                safe_print(f"[!] Could not find character/variant '{target}' in '{characters_file}'.")
+
+    return load_characters()
+
+
+def _resolve_target_section_indices(section_spec, scan_results):
+    """Resolves a section selector ('1', '1-3', or substring) into 0-based indices of `scan_results`."""
+    if not section_spec:
+        return list(range(len(scan_results)))
+    raw = str(section_spec).strip()
+    if raw.lower() == "all":
+        return list(range(len(scan_results)))
+    nums = parse_selection_indices(raw, len(scan_results))
+    if nums:
+        return [n - 1 for n in nums]
+    raw_low = raw.lower()
+    return [i for i, item in enumerate(scan_results) if raw_low in item["base_name"].lower()]
+
+
+def list_chapter_chunks_report(
+    scan_results,
+    master_output_dir,
+    characters_map,
+    tag_mappings=None,
+    enable_emotions=True,
+    section_filter=None,
+):
+    """Prints numbered chunks and current voice/override assignments for selected section(s)."""
+    target_indices = _resolve_target_section_indices(section_filter, scan_results)
+    for si in target_indices:
+        item = scan_results[si]
+        txt_file = item["txt_file"]
+        base_name = item["base_name"]
+        if not os.path.exists(txt_file):
+            continue
+        with open(txt_file, "r", encoding="utf-8") as f:
+            raw_text = f.read()
+        blocks = split_text_into_tagged_blocks(
+            raw_text,
+            default_character="narrator",
+            characters_map=characters_map,
+            tag_mappings=tag_mappings,
+            enable_emotions=enable_emotions,
+        )
+        chunk_dir = os.path.join(master_output_dir, "chunks_" + base_name)
+        overrides = load_chunk_overrides(chunk_dir)
+
+        safe_print("\n" + "=" * 72)
+        safe_print(f" [{item['idx']:02d}] Chunks in '{base_name}' ({len(blocks)} chunks) [{item['status']}]:")
+        safe_print("=" * 72)
+        for idx_b, b in enumerate(blocks, 1):
+            ov = overrides.get(str(idx_b), {})
+            eff_char = ov.get("character", b["character"])
+            eff_var = ov.get("variant", b.get("emotion", ""))
+            eff_vol = ov.get("volume", None)
+            if b["type"] == "DIVIDER":
+                safe_print(f"  [{idx_b:03d}] [DIVIDER]                  | (2s Silence Pause)")
+            else:
+                tag_lbl = f"{eff_char}:{eff_var}" if eff_var else eff_char
+                if ov:
+                    tag_lbl += "*"
+                if eff_vol is not None:
+                    tag_lbl += f" vol={eff_vol:.2f}x"
+                preview = b["text"].replace("\n", " ").strip()
+                if len(preview) > 52:
+                    preview = preview[:52] + "..."
+                safe_print(f"  [{idx_b:03d}] [{tag_lbl:<24}] | {preview}")
+        safe_print("=" * 72)
+
+
+def apply_cli_chunk_operations(
+    scan_results,
+    master_output_dir,
+    characters_map,
+    tag_mappings=None,
+    enable_emotions=True,
+    section_filter=None,
+    rerecord_chunks=None,
+    set_chunk_voices=None,
+    set_chunk_volumes=None,
+    reset_chunks=None,
+):
+    """
+    Applies non-interactive chunk re-recording, voice/variant switching, volume overrides,
+    and override resets across selected sections.
+    Spec formats:
+      - rerecord_chunks : '[<sec>:]<chunk_indices>' (e.g. '2,5-7' or '1:all')
+      - set_chunk_voices: '[<sec>:]<chunk_indices>=<char>[:<variant>][@<vol>]' or '2,3=:whisper'
+      - set_chunk_volumes: '[<sec>:]<chunk_indices>=<vol>'
+      - reset_chunks    : '[<sec>:]<chunk_indices>'
+    Returns total number of chunks scheduled/updated.
+    """
+    def _split_semis(items):
+        out = []
+        for item in (items or []):
+            for piece in str(item).split(";"):
+                piece = piece.strip()
+                if piece:
+                    out.append(piece)
+        return out
+
+    def _resolve_chunks_for_section(si, idx_spec):
+        item = scan_results[si]
+        txt_file = item["txt_file"]
+        if not os.path.exists(txt_file):
+            return []
+        with open(txt_file, "r", encoding="utf-8") as f:
+            raw_text = f.read()
+        blocks = split_text_into_tagged_blocks(
+            raw_text,
+            default_character="narrator",
+            characters_map=characters_map,
+            tag_mappings=tag_mappings,
+            enable_emotions=enable_emotions,
+        )
+        if idx_spec.strip().lower() == "all":
+            sel = list(range(1, len(blocks) + 1))
+        else:
+            sel = parse_selection_indices(idx_spec, len(blocks))
+        return [ci for ci in sel if blocks[ci - 1]["type"] != "DIVIDER"]
+
+    def _split_section_and_chunks(lhs):
+        lhs = lhs.strip()
+        if ":" in lhs:
+            sec_part, chunk_part = lhs.split(":", 1)
+            return _resolve_target_section_indices(sec_part, scan_results), chunk_part.strip()
+        return _resolve_target_section_indices(section_filter, scan_results), lhs
+
+    total_updated = 0
+
+    for spec in _split_semis(rerecord_chunks):
+        sec_indices, chunk_spec = _split_section_and_chunks(spec)
+        for si in sec_indices:
+            v_indices = _resolve_chunks_for_section(si, chunk_spec)
+            if v_indices:
+                apply_chunk_override_action(scan_results[si]["txt_file"], master_output_dir, v_indices)
+                total_updated += len(v_indices)
+                safe_print(f"[OK] Scheduled {len(v_indices)} chunk(s) in '{scan_results[si]['base_name']}' for re-recording.")
+
+    for spec in _split_semis(set_chunk_voices):
+        if "=" not in spec:
+            safe_print(f"[!] Ignoring invalid --set-chunk-voice spec '{spec}'.")
+            continue
+        lhs, rhs = spec.split("=", 1)
+        sec_indices, chunk_spec = _split_section_and_chunks(lhs)
+        rhs = rhs.strip()
+        new_vol = None
+        if "@" in rhs:
+            rhs, vol_part = rhs.rsplit("@", 1)
+            try:
+                parsed_v = float(vol_part.strip())
+                if parsed_v > 0:
+                    new_vol = parsed_v
+            except ValueError:
+                pass
+        if ":" in rhs:
+            c_part, v_part = rhs.split(":", 1)
+            new_char = c_part.strip() or None
+            v_clean = v_part.strip().lower()
+            new_var = "" if v_clean in ("", "none", "clear", "baseline", "-") else v_clean
+            set_var = True
+        else:
+            new_char = rhs.strip() or None
+            new_var = None
+            set_var = False
+
+        if new_char:
+            canon = tag_mappings.get(new_char.lower(), new_char.lower()) if tag_mappings else new_char.lower()
+            new_char = canon
+
+        for si in sec_indices:
+            v_indices = _resolve_chunks_for_section(si, chunk_spec)
+            if v_indices:
+                apply_chunk_override_action(
+                    scan_results[si]["txt_file"],
+                    master_output_dir,
+                    v_indices,
+                    new_char=new_char,
+                    new_variant=new_var,
+                    set_variant=set_var,
+                    new_volume=new_vol,
+                )
+                total_updated += len(v_indices)
+                safe_print(f"[OK] Updated voice override for {len(v_indices)} chunk(s) in '{scan_results[si]['base_name']}'.")
+
+    for spec in _split_semis(set_chunk_volumes):
+        if "=" not in spec:
+            safe_print(f"[!] Ignoring invalid --set-chunk-volume spec '{spec}'.")
+            continue
+        lhs, rhs = spec.split("=", 1)
+        sec_indices, chunk_spec = _split_section_and_chunks(lhs)
+        try:
+            new_vol = float(rhs.strip())
+            if new_vol <= 0:
+                continue
+        except ValueError:
+            safe_print(f"[!] Invalid volume in '{spec}'.")
+            continue
+        for si in sec_indices:
+            v_indices = _resolve_chunks_for_section(si, chunk_spec)
+            if v_indices:
+                apply_chunk_override_action(
+                    scan_results[si]["txt_file"],
+                    master_output_dir,
+                    v_indices,
+                    new_volume=new_vol,
+                )
+                total_updated += len(v_indices)
+                safe_print(f"[OK] Updated volume={new_vol:.2f}x for {len(v_indices)} chunk(s) in '{scan_results[si]['base_name']}'.")
+
+    for spec in _split_semis(reset_chunks):
+        sec_indices, chunk_spec = _split_section_and_chunks(spec)
+        for si in sec_indices:
+            v_indices = _resolve_chunks_for_section(si, chunk_spec)
+            if v_indices:
+                apply_chunk_override_action(
+                    scan_results[si]["txt_file"],
+                    master_output_dir,
+                    v_indices,
+                    clear_override=True,
+                )
+                total_updated += len(v_indices)
+                safe_print(f"[OK] Reset overrides for {len(v_indices)} chunk(s) in '{scan_results[si]['base_name']}'.")
+
+    return total_updated
+
+
 def convert_audiobook(
     manifest_file=MANIFEST_FILE,
     enable_emotions=None,
     interactive=True,
-    normalize_volume=True,
+    normalize_volume=None,
     force_rerecord_menu=False,
-    random_narrator=False,
+    random_narrator=None,
     narrator_gender="any",
     narrator_accent="any",
     narrator_voices="2-4",
     save_random_narrator=False,
+    narrator_voice=None,
+    set_volumes=None,
+    adjust_volumes=False,
+    review_tags=None,
+    list_tags=False,
+    set_tags=None,
+    untag_specs=None,
+    remap_tags=None,
+    map_aliases=None,
+    existing_action=None,
+    rerecord_sections=None,
+    list_chunks=False,
+    rerecord_chunks=None,
+    set_chunk_voices=None,
+    set_chunk_volumes=None,
+    reset_chunks=None,
+    skip_render=False,
 ):
     """
     Renders an audiobook from a chapter manifest using simultaneous CPU Kokoro and GPU F5-TTS.
@@ -2284,6 +2562,33 @@ def convert_audiobook(
     # Load character profiles and tag mappings
     characters = load_characters()
     tag_mappings = load_tag_mappings()
+
+    # Optional CLI dialogue tag inspection / editing / review before audio rendering
+    has_cli_tag_ops = bool(list_tags or set_tags or untag_specs or remap_tags or map_aliases)
+    if has_cli_tag_ops or review_tags is True or (interactive and review_tags is None):
+        try:
+            import llm_dialogue_tagger as ldt
+            if has_cli_tag_ops:
+                ldt.apply_cli_tag_operations(
+                    chapter_files,
+                    list_tags=list_tags,
+                    set_tags=set_tags,
+                    untag_specs=untag_specs,
+                    remap_tags=remap_tags,
+                    map_aliases=map_aliases,
+                )
+            if review_tags is True:
+                ldt.interactive_review_dialogue_tags(chapter_files, force_open=True)
+            elif interactive and review_tags is None:
+                ldt.interactive_review_dialogue_tags(chapter_files, force_open=False)
+            characters = load_characters()
+            tag_mappings = load_tag_mappings()
+        except Exception as e:
+            safe_print(f"[!] Warning during dialogue tag check: {e}")
+
+    if set_volumes:
+        characters = apply_cli_volume_updates(characters, set_volumes)
+
     safe_print(f"\nLoaded {len(characters)} character profiles from '{CHARACTERS_FILE}':")
     for name, cfg in characters.items():
         disp_name = cfg.get("display_name", name)
@@ -2297,7 +2602,19 @@ def convert_audiobook(
         else:
             safe_print(f"  - [{disp_name}]: F5-TTS (GPU) -> {cfg.get('ref_audio', '')}{vol_str}{var_str}")
 
-    if random_narrator:
+    if narrator_voice:
+        nar = dict(characters.get("narrator", {}))
+        nar["display_name"] = nar.get("display_name", "narrator")
+        nar["engine"] = "kokoro"
+        nar["voice"] = narrator_voice
+        nar.setdefault("pitch", 1.0)
+        nar.setdefault("speed", 1.0)
+        nar.setdefault("volume", 1.0)
+        characters["narrator"] = nar
+        if save_random_narrator:
+            save_narrator_voice_update(narrator_voice)
+        safe_print(f"\n[*] Narrator voice overridden: {narrator_voice}")
+    elif random_narrator is True:
         characters, rolled_voice = apply_random_narrator_to_characters(
             characters,
             gender=narrator_gender or "any",
@@ -2309,23 +2626,32 @@ def convert_audiobook(
         safe_print(f"    ({summarize_kokoro_blend(rolled_voice)})")
         if save_random_narrator:
             safe_print(f"[OK] Saved randomized narrator voice to '{CHARACTERS_FILE}'.")
-    elif interactive:
+    elif random_narrator is None and interactive:
         characters = interactive_randomize_narrator(characters)
 
-    if interactive:
-        safe_print("\nVoice Volume Options:")
-        safe_print("  [1] Auto-balanced (recommended, uses per-voice 'volume' multipliers) [Default]")
-        safe_print("  [2] Unbalanced / Raw volumes (only applies explicit 'volume' multipliers)")
-        safe_print("  [3] Adjust voice volume(s) now in characters.json")
-        vol_choice = input("Select option [1, 2, or 3] (default 1): ").strip()
-        if vol_choice == "3":
-            characters = interactive_adjust_volumes(characters)
-            safe_print("  [1] Auto-balanced [Default]  |  [2] Unbalanced / Raw")
-            bal_ans = input("Use auto-balancing on render? [1 or 2] (default 1): ").strip()
-            normalize_volume = (bal_ans != "2")
-        elif vol_choice == "2":
-            normalize_volume = False
-        safe_print(f"[*] Volume Mode: {'Auto-Balanced' if normalize_volume else 'Raw (Per-Voice Multipliers Only)'}")
+    if adjust_volumes and interactive:
+        characters = interactive_adjust_volumes(characters)
+
+    if normalize_volume is None:
+        if interactive and not set_volumes and not adjust_volumes:
+            safe_print("\nVoice Volume Options:")
+            safe_print("  [1] Auto-balanced (recommended, uses per-voice 'volume' multipliers) [Default]")
+            safe_print("  [2] Unbalanced / Raw volumes (only applies explicit 'volume' multipliers)")
+            safe_print("  [3] Adjust voice volume(s) now in characters.json")
+            vol_choice = input("Select option [1, 2, or 3] (default 1): ").strip()
+            if vol_choice == "3":
+                characters = interactive_adjust_volumes(characters)
+                safe_print("  [1] Auto-balanced [Default]  |  [2] Unbalanced / Raw")
+                bal_ans = input("Use auto-balancing on render? [1 or 2] (default 1): ").strip()
+                normalize_volume = (bal_ans != "2")
+            elif vol_choice == "2":
+                normalize_volume = False
+            else:
+                normalize_volume = True
+        else:
+            normalize_volume = True
+
+    safe_print(f"[*] Volume Mode: {'Auto-Balanced' if normalize_volume else 'Raw (Per-Voice Multipliers Only)'}")
 
     if tag_mappings:
         safe_print(f"\nLoaded {len(tag_mappings)} tag/alias mapping(s) from '{TAG_MAPPINGS_FILE}':")
@@ -2355,33 +2681,85 @@ def convert_audiobook(
     write_production_voice_roster(master_output_dir, book_title_base, characters)
 
     # ==================== UPFRONT RE-RECORD SCANNER ====================
-    scan_results = []
-    has_existing = False
-    for idx, txt_file in enumerate(chapter_files, 1):
-        bname = os.path.splitext(os.path.basename(txt_file))[0]
-        final_mp3 = os.path.join(master_output_dir, f"{bname}_complete.mp3")
-        chunk_dir = os.path.join(master_output_dir, "chunks_" + bname)
-        chunks_count = 0
-        if os.path.exists(chunk_dir):
-            chunks_count = len([f for f in os.listdir(chunk_dir) if f.startswith("chunk_") and f.endswith(".wav") and os.path.getsize(os.path.join(chunk_dir, f)) > 0])
+    def _build_scan_results():
+        results = []
+        found_existing = False
+        for idx, txt_file in enumerate(chapter_files, 1):
+            bname = os.path.splitext(os.path.basename(txt_file))[0]
+            final_mp3 = os.path.join(master_output_dir, f"{bname}_complete.mp3")
+            chunk_dir = os.path.join(master_output_dir, "chunks_" + bname)
+            chunks_count = 0
+            if os.path.exists(chunk_dir):
+                chunks_count = len([f for f in os.listdir(chunk_dir) if f.startswith("chunk_") and f.endswith(".wav") and os.path.getsize(os.path.join(chunk_dir, f)) > 0])
 
-        if os.path.exists(final_mp3) and os.path.getsize(final_mp3) > 0:
-            status = "COMPLETED (MP3 exists)"
-            has_existing = True
-        elif chunks_count > 0:
-            status = f"PARTIAL ({chunks_count} chunks rendered)"
-            has_existing = True
-        else:
-            status = "NEW"
+            if os.path.exists(final_mp3) and os.path.getsize(final_mp3) > 0:
+                status = "COMPLETED (MP3 exists)"
+                found_existing = True
+            elif chunks_count > 0:
+                status = f"PARTIAL ({chunks_count} chunks rendered)"
+                found_existing = True
+            else:
+                status = "NEW"
 
-        scan_results.append({
-            "idx": idx,
-            "txt_file": txt_file,
-            "base_name": bname,
-            "status": status,
-        })
+            results.append({
+                "idx": idx,
+                "txt_file": txt_file,
+                "base_name": bname,
+                "status": status,
+            })
+        return results, found_existing
 
-    if (has_existing or force_rerecord_menu) and interactive:
+    scan_results, has_existing = _build_scan_results()
+
+    # Non-interactive CLI chunk listing & overrides
+    has_cli_chunk_ops = bool(rerecord_chunks or set_chunk_voices or set_chunk_volumes or reset_chunks)
+    if has_cli_chunk_ops:
+        apply_cli_chunk_operations(
+            scan_results=scan_results,
+            master_output_dir=master_output_dir,
+            characters_map=characters,
+            tag_mappings=tag_mappings,
+            enable_emotions=enable_emotions,
+            section_filter=rerecord_sections,
+            rerecord_chunks=rerecord_chunks,
+            set_chunk_voices=set_chunk_voices,
+            set_chunk_volumes=set_chunk_volumes,
+            reset_chunks=reset_chunks,
+        )
+        scan_results, has_existing = _build_scan_results()
+
+    if list_chunks:
+        list_chapter_chunks_report(
+            scan_results=scan_results,
+            master_output_dir=master_output_dir,
+            characters_map=characters,
+            tag_mappings=tag_mappings,
+            enable_emotions=enable_emotions,
+            section_filter=rerecord_sections,
+        )
+
+    # Non-interactive existing-audio actions
+    if existing_action == "rerecord-all":
+        safe_print("\n[*] Clearing ALL previous recordings (--rerecord-all). Re-recording entire book from scratch...")
+        for item in scan_results:
+            clear_chapter_recording(master_output_dir, item["base_name"])
+        safe_print("[OK] All sections cleared.")
+    elif existing_action == "rerecord-sections" or (rerecord_sections and not has_cli_chunk_ops and not list_chunks and existing_action != "rerecord-chunks"):
+        sel_spec = rerecord_sections or "all"
+        to_clear = [i + 1 for i in _resolve_target_section_indices(sel_spec, scan_results)]
+        for num in to_clear:
+            item = scan_results[num - 1]
+            clear_chapter_recording(master_output_dir, item["base_name"])
+            safe_print(f"[OK] Cleared section '{item['base_name']}' for re-recording.")
+    elif existing_action == "rerecord-chunks" or (force_rerecord_menu and interactive):
+        interactive_rerecord_chunks(
+            scan_results,
+            master_output_dir,
+            characters,
+            tag_mappings=tag_mappings,
+            enable_emotions=enable_emotions,
+        )
+    elif (has_existing or force_rerecord_menu) and interactive and existing_action != "resume" and not has_cli_chunk_ops:
         safe_print("\n" + "=" * 70)
         safe_print("                 Existing Audio Sections Detected")
         safe_print("=" * 70)
@@ -2393,10 +2771,8 @@ def convert_audiobook(
         safe_print("  [2] Re-record EVERYTHING from scratch")
         safe_print("  [3] Choose specific sections to re-record completely")
         safe_print("  [4] Choose specific CHUNKS to re-record / change chunk voice")
-        if force_rerecord_menu:
-            choice = "4"
-        else:
-            choice = input("\nSelect how to proceed [1, 2, 3, or 4] (default 1): ").strip()
+        safe_print("  [5] Review / edit dialogue tags in chapter text (if applicable)")
+        choice = input("\nSelect how to proceed [1, 2, 3, 4, or 5] (default 1): ").strip()
 
         if choice == "2":
             safe_print("\n[*] Clearing ALL previous recordings. Re-recording entire book from scratch...")
@@ -2431,8 +2807,20 @@ def convert_audiobook(
                 tag_mappings=tag_mappings,
                 enable_emotions=enable_emotions,
             )
+        elif choice == "5":
+            try:
+                import llm_dialogue_tagger as ldt
+                ldt.interactive_review_dialogue_tags(chapter_files, force_open=True)
+                characters = load_characters()
+                tag_mappings = load_tag_mappings()
+            except Exception as e:
+                safe_print(f"[!] Could not open dialogue tag reviewer: {e}")
     elif has_existing and not interactive:
         safe_print("\n[*] Existing audio sections detected. Resuming automatically (skipping completed).")
+
+    if skip_render:
+        safe_print("\n[*] Skipping audio synthesis (--skip-render).")
+        return True
 
     # ==================== MAIN PROCESSING LOOP ====================
     for idx, txt_file in enumerate(chapter_files, 1):
@@ -2486,9 +2874,13 @@ def main():
     parser.add_argument("--manifest", default=MANIFEST_FILE, help="Path to manifest file listing chapters (default: chapters.txt).")
     parser.add_argument("--emotions", dest="enable_emotions", action="store_true", default=None, help="Enable dialogue emotion/alt voice routing.")
     parser.add_argument("--no-emotions", dest="enable_emotions", action="store_false", help="Disable acoustic emotion routing (alt voices still apply).")
-    parser.add_argument("--no-volume-balance", dest="normalize_volume", action="store_false", default=True, help="Disable automatic active-speech loudness balancing.")
-    parser.add_argument("--rerecord", action="store_true", default=False, help="Jump directly to chunk-level re-record / voice switching when existing audio is found.")
-    parser.add_argument("--random-narrator", action="store_true", default=False, help="Randomize the narrator using random Kokoro TTS voices.")
+    parser.add_argument("--volume-balance", "--auto-balance", dest="normalize_volume", action="store_true", default=None, help="Enable automatic active-speech loudness balancing.")
+    parser.add_argument("--no-volume-balance", "--raw-volume", dest="normalize_volume", action="store_false", help="Disable automatic active-speech loudness balancing.")
+    parser.add_argument("--set-volume", "--volume", dest="set_volumes", action="append", default=[], help="Update character/variant volume in characters.json, e.g. 'Alice=1.2' or 'Bob:shout=0.9'.")
+    parser.add_argument("--adjust-volumes", action="store_true", default=False, help="Open interactive voice volume editor.")
+    parser.add_argument("--narrator-voice", type=str, default=None, help="Explicit Kokoro voice or blend string for narrator.")
+    parser.add_argument("--random-narrator", dest="random_narrator", action="store_true", default=None, help="Randomize the narrator using random Kokoro TTS voices.")
+    parser.add_argument("--keep-narrator", "--no-random-narrator", dest="random_narrator", action="store_false", help="Keep the existing narrator from characters.json without prompting.")
     parser.add_argument(
         "--narrator-gender",
         choices=["female", "male", "mostly-female", "mostly-male", "any"],
@@ -2507,17 +2899,46 @@ def main():
         default=None,
         help="Number or range of Kokoro voices to mix for randomized narrator (e.g. '3' or '2-4').",
     )
-    parser.add_argument("--save-narrator", action="store_true", default=False, help="Save randomized narrator voice into characters.json.")
+    parser.add_argument("--save-narrator", dest="save_narrator", action="store_true", default=False, help="Save randomized/updated narrator voice into characters.json.")
+    parser.add_argument("--no-save-narrator", dest="save_narrator", action="store_false", help="Use randomized narrator for this run only.")
+    parser.add_argument("--review-tags", "--review", dest="review_tags", action="store_true", default=None, help="Interactively review and edit dialogue tags before rendering.")
+    parser.add_argument("--no-review-tags", dest="review_tags", action="store_false", help="Skip interactive dialogue tag review.")
+    parser.add_argument("--list-tags", "--show-tags", action="store_true", default=False, help="Print numbered dialogue tags for chapters in manifest.")
+    parser.add_argument("--set-tag", "--change-tag", "--edit-tag", dest="set_tags", action="append", default=[], help="Change dialogue tag(s), e.g. '1=Alice' or '2,4-6=Bob:whisper'.")
+    parser.add_argument("--untag", dest="untag_specs", action="append", default=[], help="Untag dialogue quote(s) so Narrator reads them.")
+    parser.add_argument("--remap-tag", "--rename-tag", dest="remap_tags", action="append", default=[], help="Bulk remap speaker tags, e.g. 'OldName=NewName'.")
+    parser.add_argument("--map-alias", dest="map_aliases", action="append", default=[], help="Map tag alias in tag_mappings.json, e.g. 'bobby=Bob'.")
+    parser.add_argument("--existing-action", "--on-existing", dest="existing_action", choices=["resume", "rerecord-all", "rerecord-sections", "rerecord-chunks"], default=None, help="Action when existing audio is detected.")
+    parser.add_argument("--resume", dest="existing_action", action="store_const", const="resume", help="Resume existing audio without prompting.")
+    parser.add_argument("--rerecord-all", dest="existing_action", action="store_const", const="rerecord-all", help="Clear and re-record all chapters from scratch.")
+    parser.add_argument("--rerecord-sections", "--sections", dest="rerecord_sections", type=str, default=None, help="Specific section indices or names to re-record or target (e.g. '1,3' or '2-4' or 'all').")
+    parser.add_argument("--rerecord", action="store_true", default=False, help="Jump directly to chunk-level re-record / voice switching menu.")
+    parser.add_argument("--list-chunks", "--show-chunks", action="store_true", default=False, help="Print numbered audio chunks for selected sections.")
+    parser.add_argument("--rerecord-chunks", dest="rerecord_chunks", action="append", default=[], help="Re-record specific chunks, e.g. '2,5-7' or '1:2,5-7'.")
+    parser.add_argument("--set-chunk-voice", "--chunk-voice", dest="set_chunk_voices", action="append", default=[], help="Override chunk voice, e.g. '2,3=Bob:whisper@1.1' or '4=:shout'.")
+    parser.add_argument("--set-chunk-volume", "--chunk-volume", dest="set_chunk_volumes", action="append", default=[], help="Override chunk volume multiplier, e.g. '2,3=1.25'.")
+    parser.add_argument("--reset-chunks", dest="reset_chunks", action="append", default=[], help="Clear chunk voice/volume overrides, e.g. '2,3' or 'all'.")
+    parser.add_argument("--skip-render", "--no-render", action="store_true", default=False, help="Apply inspection/tag/chunk edits without running TTS synthesis.")
+    parser.add_argument("--interactive", "-i", action="store_true", default=False, help="Prompt interactively for unspecified options.")
+    parser.add_argument("--yes", "-y", "--non-interactive", dest="non_interactive", action="store_true", default=False, help="Run non-interactively with defaults for unspecified options.")
     args, _ = parser.parse_known_args()
 
-    use_random_narrator = args.random_narrator or any(
+    has_cli_flags = len(sys.argv) > 1
+    is_interactive = args.interactive or (not has_cli_flags and not args.non_interactive)
+
+    if args.random_narrator is True or any(
         val is not None for val in (args.narrator_gender, args.narrator_accent, args.narrator_voices)
-    )
+    ):
+        use_random_narrator = True
+    elif args.random_narrator is False:
+        use_random_narrator = False
+    else:
+        use_random_narrator = None
 
     convert_audiobook(
         manifest_file=args.manifest,
         enable_emotions=args.enable_emotions,
-        interactive=True,
+        interactive=is_interactive,
         normalize_volume=args.normalize_volume,
         force_rerecord_menu=args.rerecord,
         random_narrator=use_random_narrator,
@@ -2525,6 +2946,23 @@ def main():
         narrator_accent=args.narrator_accent or "any",
         narrator_voices=args.narrator_voices or "2-4",
         save_random_narrator=args.save_narrator,
+        narrator_voice=args.narrator_voice,
+        set_volumes=args.set_volumes,
+        adjust_volumes=args.adjust_volumes,
+        review_tags=args.review_tags,
+        list_tags=args.list_tags,
+        set_tags=args.set_tags,
+        untag_specs=args.untag_specs,
+        remap_tags=args.remap_tags,
+        map_aliases=args.map_aliases,
+        existing_action=args.existing_action,
+        rerecord_sections=args.rerecord_sections,
+        list_chunks=args.list_chunks,
+        rerecord_chunks=args.rerecord_chunks,
+        set_chunk_voices=args.set_chunk_voices,
+        set_chunk_volumes=args.set_chunk_volumes,
+        reset_chunks=args.reset_chunks,
+        skip_render=args.skip_render,
     )
 
 
