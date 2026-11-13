@@ -45,6 +45,7 @@ old_code/
 wavs/
 F5-TTS/
 test_code/
+scratch/
 
 # Legacy / unused files (excluded from GitHub submission)
 *.txt

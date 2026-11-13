@@ -183,6 +183,9 @@ def run_full_pipeline(
     narrator_accent: str = "any",
     narrator_voices: str = "2-4",
     save_random_narrator: bool = False,
+    append_to_book: str = None,
+    only_new: bool = None,
+    select_chapters: str = None,
 ):
     """
     Executes all stages of the audiobook generator:
@@ -210,6 +213,9 @@ def run_full_pipeline(
         should_unwrap=should_unwrap,
         trailing_mode=trailing_mode,
         bulk_cut_count=bulk_cut_count,
+        append_to_book=append_to_book,
+        only_new=only_new,
+        select_chapters=select_chapters,
     )
 
     if not created_chapter_files:
@@ -232,18 +238,13 @@ def run_full_pipeline(
         )
 
         if tagged_files:
-            final_manifest_files = tagged_files
-            with open(MANIFEST_FILE, "w", encoding="utf-8") as mf:
-                for tf in tagged_files:
-                    mf.write(tf + "\n")
-            print(f"[✓] Dialogue tagging complete! Updated '{MANIFEST_FILE}' with {len(tagged_files)} tagged chapter(s).")
+            final_manifest_files = ntp.update_manifest_file(tagged_files)
+            print(f"[✓] Dialogue tagging complete! Updated '{MANIFEST_FILE}' with {len(tagged_files)} tagged chapter(s) (preserved all chapters).")
         else:
             print("[!] Tagging produced no files; falling back to untagged parsed chapters.")
     else:
         print(f"\n[Step 3/4] Skipping dialogue tagging as requested. Manifest points to parsed chapters.")
-        with open(MANIFEST_FILE, "w", encoding="utf-8") as mf:
-            for cf in created_chapter_files:
-                mf.write(cf + "\n")
+        final_manifest_files = ntp.update_manifest_file(created_chapter_files)
 
     # ---------------- STAGE 4: AUDIO CONVERSION ----------------
     if skip_audio:
@@ -384,6 +385,33 @@ def main():
         default=False,
         help="Save randomized narrator voice into characters.json.",
     )
+    parser.add_argument(
+        "--append-to",
+        "--append",
+        "--add-to",
+        dest="append_to_book",
+        default=None,
+        help="Append new chapter(s) to an existing book (preserves previous chapters and tracks).",
+    )
+    parser.add_argument(
+        "--chapters",
+        "--chaps",
+        dest="select_chapters",
+        default=None,
+        help="Specific chapter numbers or ranges to process/append (e.g. '5', '5-8', '5+').",
+    )
+    parser.add_argument(
+        "--only-new",
+        action="store_true",
+        default=None,
+        help="When appending an updated full work, automatically extract only newly posted chapters.",
+    )
+    parser.add_argument(
+        "--all-chapters",
+        action="store_true",
+        default=False,
+        help="Force extracting all chapters even if previous chapters exist.",
+    )
 
     args = parser.parse_args()
     use_random_narrator = args.random_narrator or any(
@@ -411,6 +439,23 @@ def main():
         tag_dialogue = args.tag_dialogue
         enable_emotions = args.enable_emotions
 
+    existing_books = ntp.get_existing_books(ntp.OUTPUT_DIR, ldt.DEFAULT_OUTPUT_DIR, FINISHED_DIR)
+    append_to_book = None
+    if args.append_to_book:
+        resolved = ntp.resolve_book_name(args.append_to_book, existing_books)
+        append_to_book = resolved if resolved else ntp.sanitize_filename(args.append_to_book)
+        print(f"[*] Appending to existing book: '{append_to_book}'")
+    elif is_interactive:
+        print("\nTarget Book Destination:")
+        print("  [1] Create a new book [Default]")
+        print("  [2] Add chapter(s) to an existing book (select from list or enter title)")
+        dest_sel = input("Select destination [1 or 2] (default 1): ").strip()
+        if dest_sel == "2":
+            append_to_book = ntp.interactive_select_existing_book(existing_books)
+            print(f"[*] Appending to existing book: '{append_to_book}'")
+
+    only_new = False if args.all_chapters else (True if args.only_new else None)
+
     run_full_pipeline(
         source=source,
         tag_dialogue=tag_dialogue,
@@ -429,6 +474,9 @@ def main():
         narrator_accent=args.narrator_accent or "any",
         narrator_voices=args.narrator_voices or "2-4",
         save_random_narrator=args.save_narrator,
+        append_to_book=append_to_book,
+        only_new=only_new,
+        select_chapters=args.select_chapters,
     )
 
 

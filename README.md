@@ -18,6 +18,7 @@ An automated text-to-speech (TTS) pipeline designed for creating audiobooks with
   * Strips fanfiction/AO3 metadata, author notes, chapter summaries, and end notes.
   * Optionally heals manual hard-wrapped line breaks while preserving dialogue and section dividers.
   * Interactive or bulk trailing section removal (with live text excerpts).
+  * **Seamless Chapter Appending**: Add new chapters to existing books with continuous sequential track prefixes and chapter numbers without recreating intros or wiping existing manifests.
 * **Smart Dialogue & Emotion Tagger (`llm_dialogue_tagger.py`)**:
   * **Fast Smart Parser (Instant & 100% Quote Coverage)**: Grammar-aware speech verb detection and conversational turn-taking tags entire books in seconds with zero GPU wait.
   * **Dialogue Emotion Routing**: Detects conversational tones (whisper, shout, calm, sad, etc.) and routes them to character emotion reference clips with zero synthetic distortion.
@@ -114,7 +115,15 @@ python run_pipeline.py raw_txt/my_story.txt
 # From an EPUB or PDF ebook:
 python run_pipeline.py "C:\Books\my_book.epub"
 
-# Interactive Menu (choose existing files from raw_txt/):
+# Append new chapter(s) to an existing book (renders only new chapters & updates the full audiobook):
+python run_pipeline.py "https://archiveofourown.org/works/12345/chapters/67890" --append-to "My_Story_Title"
+python run_pipeline.py raw_txt/chapter_5.txt --append-to "My_Story_Title"
+# Passing an updated full work (with chapters 1-5) will automatically extract only the new Chapter 5:
+python run_pipeline.py "https://archiveofourown.org/works/12345" --append-to "My_Story_Title" --only-new
+# Append specific chapter numbers or ranges to any custom or differently named book:
+python run_pipeline.py raw_txt/story.txt --append-to "Custom_Book_Title" --chapters "5-7"
+
+# Interactive Menu (prompts to create new book or add to existing book):
 python run_pipeline.py
 ```
 
@@ -145,12 +154,22 @@ Clean text is automatically saved into `raw_txt/` (and EPUBs into `raw_epub/`).
 ### Step 2: Parse and Clean Chapters (`new_text_parser.py`)
 ```powershell
 python new_text_parser.py
+# Or append to an existing book directly via CLI:
+python new_text_parser.py raw_txt/chapter_6.txt --append-to "My_Book_Title"
 ```
 * **Interactive Prompts**:
   1. **File Selection**: Choose which file from `raw_txt/` to process.
-  2. **Multi-Newline Dividers**: Convert consecutive blank lines into `***` scene pauses.
-  3. **Hard-Wrap Healing**: Merge lines split by manual line breaks into natural paragraphs.
-  4. **Trailing Section Review**: Review trailing sections chapter-by-chapter (with live excerpts) to remove author notes.
+  2. **Book Destination**: Choose between creating a new book or adding chapter(s) to an existing book.
+  3. **Multi-Newline Dividers**: Convert consecutive blank lines into `***` scene pauses.
+  4. **Hard-Wrap Healing**: Merge lines split by manual line breaks into natural paragraphs.
+  5. **Trailing Section Review**: Review trailing sections chapter-by-chapter (with live excerpts) to remove author notes.
+* **Adding Chapters to an Existing Book**:
+  * **Select Any Book Destination**: In interactive mode, select from a numbered list of existing books in your workspace, or choose `[0]` to type any custom/alternate book title. Or use `--append-to "Custom_Title"` via CLI.
+  * **Selective Chapter Appending (`--chapters`)**: Pass specific chapter numbers or ranges via `--chapters "5"`, `--chapters "5-8"`, or `--chapters "5+"`, or pick them interactively from the chapter selection menu.
+  * **Seamless Continuous Numbering**: New chapters are automatically numbered with continuous track prefixes (`05_`, `06_`) and chapter headers without recreating `00_intro`.
+  * **Updated Full Work Support (`--only-new`)**: If an author posts a new chapter and you pass the full updated story (e.g. Chapters 1–5), the parser detects that Chapters 1–4 already exist in your book, prompts to add only the new Chapter 5, and extracts only Chapter 5.
+  * `chapters.txt` retains all previous chapters while appending newly added chapters.
+  * When generating audio, `local_hybrid_audioconverter.py` automatically detects existing `_complete.mp3` chapter files and skips re-rendering them, generating only newly appended chapters and updating the complete audiobook package and ZIP.
 * Parsed chapters are saved to `parsed_chapters/<BookTitle>/` and registered in `chapters.txt`.
 
 ### Step 3: Configure Character Voices (`characters.json`)

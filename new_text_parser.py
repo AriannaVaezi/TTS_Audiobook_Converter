@@ -1,7 +1,8 @@
+import argparse
+import glob
+import json
 import os
 import re
-import json
-import glob
 import sys
 
 if hasattr(sys.stdout, 'reconfigure'):
@@ -10,6 +11,8 @@ if hasattr(sys.stdout, 'reconfigure'):
 # ==================== CONFIGURATION ====================
 RAW_DIR = "raw_txt"
 OUTPUT_DIR = "parsed_chapters"
+TAGGED_DIR = "tagged_chapters"
+FINISHED_DIR = "finished"
 MANIFEST_FILE = "chapters.txt"
 REPLACEMENTS_FILE = "replacements.json"
 # ========================================================
@@ -402,6 +405,229 @@ def clean_web_fiction_header_and_metadata(raw_text, input_file_path):
     return work_title, author, clean_file_base, body_text
 
 
+def get_existing_books(parsed_dir=None, tagged_dir=None, finished_dir=None):
+    """
+    Returns a dictionary of existing book directories found across
+    parsed_chapters/, tagged_chapters/, and finished/.
+    """
+    p_dir = parsed_dir or OUTPUT_DIR
+    t_dir = tagged_dir or TAGGED_DIR
+    f_dir = finished_dir or FINISHED_DIR
+
+    books = {}
+    for d in (p_dir, t_dir):
+        if os.path.exists(d):
+            for entry in os.scandir(d):
+                if entry.is_dir() and not entry.name.startswith("."):
+                    txts = [f for f in os.listdir(entry.path) if f.endswith(".txt") and os.path.getsize(os.path.join(entry.path, f)) > 0]
+                    if entry.name not in books:
+                        books[entry.name] = {"name": entry.name, "chapter_count": 0}
+                    books[entry.name]["chapter_count"] = max(books[entry.name]["chapter_count"], len(txts))
+
+    if os.path.exists(f_dir):
+        for entry in os.scandir(f_dir):
+            if entry.is_dir() and entry.name.endswith("_hybrid_audiobook_output"):
+                bname = entry.name[:-len("_hybrid_audiobook_output")]
+                if bname not in books:
+                    books[bname] = {"name": bname, "chapter_count": 0}
+
+    return books
+
+
+def resolve_book_name(query, existing_books):
+    """Fuzzy / case-insensitive match for existing book names."""
+    if not query:
+        return None
+    q_norm = re.sub(r"[\s\-_]+", "", query.strip().lower())
+    for name in existing_books.keys():
+        if re.sub(r"[\s\-_]+", "", name.lower()) == q_norm:
+            return name
+    return sanitize_filename(query.strip())
+
+
+def interactive_select_existing_book(existing_books):
+    """Displays menu of existing books and returns selected book folder name."""
+    book_list = sorted(existing_books.values(), key=lambda b: b["name"].lower()) if existing_books else []
+    if book_list:
+        print("\nExisting Books in Workspace:")
+        for idx, b in enumerate(book_list, 1):
+            cnt = b.get("chapter_count", 0)
+            cnt_str = f" ({cnt} chapter{'s' if cnt != 1 else ''})" if cnt else ""
+            print(f"  [{idx:2d}] {b['name']}{cnt_str}")
+        print("  [ 0] Enter a different book name manually")
+
+        choice = input(f"\nSelect book number [1-{len(book_list)}] or enter name (default 1): ").strip()
+        if not choice or choice == "1":
+            return book_list[0]["name"]
+        if choice == "0":
+            custom = input("Enter book title: ").strip()
+            return sanitize_filename(custom) if custom else book_list[0]["name"]
+        try:
+            num = int(choice)
+            if 1 <= num <= len(book_list):
+                return book_list[num - 1]["name"]
+        except ValueError:
+            matched = resolve_book_name(choice, existing_books)
+            if matched:
+                return matched
+            return sanitize_filename(choice)
+        return book_list[0]["name"]
+    else:
+        custom = input("\nEnter the existing book title: ").strip()
+        return sanitize_filename(custom) if custom else "audiobook"
+
+
+def inspect_existing_book_chapters(book_name, parsed_dir=None, tagged_dir=None):
+    """
+    Scans existing chapters for book_name in parsed_chapters/ and tagged_chapters/.
+    Returns info dict with max track prefix, max chapter number, intro status, and existing manifest files.
+    """
+    p_dir_base = parsed_dir or OUTPUT_DIR
+    t_dir_base = tagged_dir or TAGGED_DIR
+
+    safe_name = sanitize_filename(book_name)
+    p_dir = os.path.join(p_dir_base, safe_name)
+    t_dir = os.path.join(t_dir_base, safe_name)
+
+    p_files = {}
+    if os.path.exists(p_dir):
+        for f in os.listdir(p_dir):
+            if f.endswith(".txt") and os.path.getsize(os.path.join(p_dir, f)) > 0:
+                p_files[f] = os.path.join(p_dir, f)
+
+    t_files = {}
+    if os.path.exists(t_dir):
+        for f in os.listdir(t_dir):
+            if f.endswith(".txt") and os.path.getsize(os.path.join(t_dir, f)) > 0:
+                t_files[f] = os.path.join(t_dir, f)
+
+    all_basenames = sorted(set(p_files.keys()) | set(t_files.keys()))
+
+    has_intro = any("intro" in f.lower() for f in all_basenames)
+    max_track = 0
+    max_chapter = 0
+
+    def track_sort_key(fname):
+        m = re.match(r"^(\d+)", fname)
+        return (int(m.group(1)) if m else 9999, fname)
+
+    sorted_basenames = sorted(all_basenames, key=track_sort_key)
+    existing_manifest = []
+    existing_chapter_nums = set()
+
+    for bname in sorted_basenames:
+        m_track = re.match(r"^(\d+)", bname)
+        if m_track:
+            max_track = max(max_track, int(m_track.group(1)))
+
+        m_chap = re.search(r"Chapter_(\d+)", bname, re.IGNORECASE)
+        if m_chap:
+            c_num = int(m_chap.group(1))
+            max_chapter = max(max_chapter, c_num)
+            existing_chapter_nums.add(c_num)
+
+        if bname in t_files:
+            existing_manifest.append(t_files[bname])
+        elif bname in p_files:
+            existing_manifest.append(p_files[bname])
+
+    return {
+        "book_name": safe_name,
+        "has_intro": has_intro,
+        "max_track": max_track,
+        "max_chapter": max_chapter,
+        "existing_chapter_nums": sorted(existing_chapter_nums),
+        "existing_manifest_files": existing_manifest,
+        "parsed_dir": p_dir,
+        "tagged_dir": t_dir,
+    }
+
+
+def update_manifest_file(new_files, manifest_file=None, existing_files=None):
+    """
+    Updates manifest_file, preserving existing chapters and replacing
+    matching basenames (e.g. replacing parsed chapter with tagged chapter) or appending new chapters.
+    """
+    m_file = manifest_file or MANIFEST_FILE
+    current_lines = []
+    if os.path.exists(m_file):
+        with open(m_file, "r", encoding="utf-8") as mf:
+            current_lines = [l.strip() for l in mf if l.strip() and not l.startswith("#")]
+
+    combined_base = list(existing_files or current_lines)
+    tagged_map = {os.path.basename(f): f for f in new_files}
+
+    final_list = []
+    for line in combined_base:
+        base = os.path.basename(line)
+        if base in tagged_map:
+            final_list.append(tagged_map.pop(base))
+        else:
+            final_list.append(line)
+
+    for remaining in tagged_map.values():
+        if remaining not in final_list:
+            final_list.append(remaining)
+
+    with open(m_file, "w", encoding="utf-8") as mf:
+        for f in final_list:
+            mf.write(f"{f}\n")
+    return final_list
+
+
+def parse_chapter_selection(selection_str, available_splits):
+    """
+    Parses a user selection string into a filtered list of chapter split dicts.
+    Supports:
+      - 'all' / '*' -> all available splits
+      - '5' -> chapter 5
+      - '5,6,8' -> chapters 5, 6, 8
+      - '5-8' or '5..8' -> chapters 5 through 8 inclusive
+      - '5+' or '5:' or '5-' -> chapter 5 to the end
+      - Combinations: '1, 3, 5-8'
+    """
+    if not selection_str or selection_str.strip().lower() in ("all", "*"):
+        return list(available_splits)
+
+    s = selection_str.strip()
+    num_to_split = {ch["num"]: ch for ch in available_splits}
+    max_num = max((ch["num"] for ch in available_splits), default=len(available_splits))
+
+    selected_ids = set()
+    tokens = [t.strip() for t in re.split(r"[,;|\s]+", s) if t.strip()]
+
+    for token in tokens:
+        # Range '5-8' or '5..8'
+        m_range = re.match(r"^(\d+)\s*(?:-|--|\.\.)\s*(\d+)$", token)
+        if m_range:
+            start_n, end_n = int(m_range.group(1)), int(m_range.group(2))
+            for n in range(min(start_n, end_n), max(start_n, end_n) + 1):
+                if n in num_to_split:
+                    selected_ids.add(id(num_to_split[n]))
+            continue
+
+        # Open-ended range '5+' or '5:' or '5-'
+        m_open = re.match(r"^(\d+)\s*[:\+\-]$", token)
+        if m_open:
+            start_n = int(m_open.group(1))
+            for n in range(start_n, max_num + 1):
+                if n in num_to_split:
+                    selected_ids.add(id(num_to_split[n]))
+            continue
+
+        # Single number '5'
+        if token.isdigit():
+            n = int(token)
+            if n in num_to_split:
+                selected_ids.add(id(num_to_split[n]))
+            elif 1 <= n <= len(available_splits):
+                selected_ids.add(id(available_splits[n - 1]))
+            continue
+
+    result = [ch for ch in available_splits if id(ch) in selected_ids]
+    return result if result else list(available_splits)
+
+
 def parse_book_file(
     input_file_path,
     replacements,
@@ -409,6 +635,11 @@ def parse_book_file(
     should_unwrap=False,
     trailing_mode="none",
     bulk_cut_count=0,
+    append_to_book=None,
+    track_offset=None,
+    chapter_offset=None,
+    only_new=None,
+    select_chapters=None,
 ):
     print("\n" + "=" * 60)
     print(f"   Processing: {os.path.basename(input_file_path)}")
@@ -516,37 +747,125 @@ def parse_book_file(
                     })
                     expected_num += 1
 
+    # Pre-calculate end positions for all identified chapters
+    for idx, ch in enumerate(valid_splits):
+        ch["end"] = valid_splits[idx + 1]["start"] if idx + 1 < len(valid_splits) else len(raw_text)
+
+    safe_target_book = sanitize_filename(append_to_book) if append_to_book else None
+    safe_work_title = safe_target_book or sanitize_filename(work_title)
     book_output_dir = os.path.join(OUTPUT_DIR, safe_work_title)
     os.makedirs(book_output_dir, exist_ok=True)
+
+    existing_info = None
+    if safe_target_book:
+        existing_info = inspect_existing_book_chapters(safe_target_book)
+        has_intro = existing_info["has_intro"]
+        base_track = (existing_info["max_track"] + 1) if track_offset is None else track_offset
+        base_chap = existing_info["max_chapter"] if chapter_offset is None else chapter_offset
+        print(f"[*] Appending to existing book '{safe_work_title}' (existing chapters: {existing_info['max_track']}, next track: {base_track:02d}).")
+    else:
+        has_intro = False
+        base_track = 1
+        base_chap = 0
+
     created_files = []
 
     # =========================================================================
     # SCENARIO A: CHAPTERS FOUND
     # =========================================================================
     if valid_splits:
-        print(f"[*] Found {len(valid_splits)} chapters.")
+        print(f"[*] Found {len(valid_splits)} chapters in file.")
+
+        if select_chapters:
+            valid_splits = parse_chapter_selection(select_chapters, valid_splits)
+            print(f"[*] Filtered to {len(valid_splits)} chapter(s) via selection: {[c['num'] for c in valid_splits]}")
+
+        # Check for already-existing chapters when appending an updated full work
+        if safe_target_book and existing_info and not select_chapters:
+            existing_chapter_nums = set(existing_info.get("existing_chapter_nums", []))
+            already_present = [ch for ch in valid_splits if ch["num"] in existing_chapter_nums]
+            new_splits = [ch for ch in valid_splits if ch["num"] not in existing_chapter_nums]
+
+            # Case A: Updated full work (contains both existing chapters and new chapters)
+            if already_present and new_splits:
+                present_nums = [ch["num"] for ch in already_present]
+                range_str = f"Chapters {min(present_nums)}-{max(present_nums)}" if len(present_nums) > 1 else f"Chapter {present_nums[0]}"
+                print(f"\n[*] {range_str} already exist in '{safe_work_title}'.")
+                print(f"[*] Found {len(new_splits)} new chapter(s) in this file:")
+                for nch in new_splits:
+                    ch_title_display = f": {nch['title']}" if nch.get("title") else ""
+                    print(f"    • Chapter {nch['num']}{ch_title_display}")
+
+                is_tty = sys.stdin.isatty() if hasattr(sys.stdin, "isatty") else False
+                if only_new is None and is_tty:
+                    print("\nChapter selection options:")
+                    print(f"  [Y] Add all {len(new_splits)} new chapter(s) [Default]")
+                    print(f"  [A] Add all {len(valid_splits)} chapters from this file")
+                    print(f"  [S] Select specific chapters or range (e.g. '5', '5-7', '5+')")
+                    raw_choice = input("Select option or enter chapter numbers/range [Y/A/S] (default Y): ").strip()
+                    choice = raw_choice.lower() if raw_choice else "y"
+
+                    if choice in ("y", "yes"):
+                        valid_splits = new_splits
+                        print(f"[*] Extracting only the {len(valid_splits)} new chapter(s)...")
+                    elif choice in ("a", "all"):
+                        print(f"[*] Keeping all {len(valid_splits)} chapters.")
+                    elif choice in ("s", "select"):
+                        sel_str = input("Enter chapter numbers or ranges to append (e.g. '5', '5-7', '5+'): ").strip()
+                        valid_splits = parse_chapter_selection(sel_str, valid_splits)
+                        print(f"[*] Selected {len(valid_splits)} chapter(s): {[ch['num'] for ch in valid_splits]}")
+                    else:
+                        valid_splits = parse_chapter_selection(raw_choice, valid_splits)
+                        print(f"[*] Selected {len(valid_splits)} chapter(s): {[ch['num'] for ch in valid_splits]}")
+                elif only_new is True or (only_new is None and not is_tty):
+                    valid_splits = new_splits
+                    print(f"[*] Extracting only the {len(valid_splits)} new chapter(s)...")
+
+            # Case B: File contains ONLY existing chapters (e.g. duplicate full file)
+            elif already_present and not new_splits and len(already_present) >= len(existing_chapter_nums):
+                print(f"\n[*] Notice: All {len(valid_splits)} chapter(s) in this file already exist in '{safe_work_title}'.")
+                is_tty = sys.stdin.isatty() if hasattr(sys.stdin, "isatty") else False
+                if only_new is None and is_tty:
+                    reparse_choice = input(f"Do you want to re-parse / overwrite existing chapters? [y/N] (default N): ").strip().lower()
+                    if reparse_choice != "y":
+                        print("[*] Skipped parsing. Keeping existing book chapters intact.")
+                        return existing_info.get("existing_manifest_files", [])
+                elif only_new is True:
+                    print("[*] No new chapters to add. Keeping existing book chapters intact.")
+                    return existing_info.get("existing_manifest_files", [])
+
+            # Case C: Multiple chapters, no overlap - prompt if user wants specific chapters
+            elif len(valid_splits) > 1 and is_tty:
+                print(f"\n[*] Chapters found in file: {[ch['num'] for ch in valid_splits]}")
+                pick_choice = input(f"Append all {len(valid_splits)} chapters to '{safe_work_title}', or select specific chapters? [ALL / enter range e.g. '1-3', '5+'] (default ALL): ").strip()
+                if pick_choice and pick_choice.lower() not in ("all", "a", "*"):
+                    valid_splits = parse_chapter_selection(pick_choice, valid_splits)
+                    print(f"[*] Filtered to {len(valid_splits)} chapter(s): {[ch['num'] for ch in valid_splits]}")
 
         # --- 1. Intro Processing ---
-        if author_line:
-            intro_content = f"{work_title}\n\n{author_line}\n\n***"
+        if not has_intro:
+            if author_line:
+                intro_content = f"{work_title}\n\n{author_line}\n\n***"
+            else:
+                intro_content = f"{work_title}\n\n***"
+
+            intro_content = apply_word_replacements(intro_content, replacements)
+            intro_content = normalize_dividers(intro_content)
+
+            intro_filename = os.path.join(book_output_dir, f"00_intro_{safe_work_title}.txt")
+            with open(intro_filename, "w", encoding="utf-8") as out_f:
+                out_f.write(intro_content)
+            created_files.append(intro_filename)
+            print(f"  [+] Created Intro: {intro_filename}")
         else:
-            intro_content = f"{work_title}\n\n***"
-
-        intro_content = apply_word_replacements(intro_content, replacements)
-        intro_content = normalize_dividers(intro_content)
-
-        intro_filename = os.path.join(book_output_dir, f"00_intro_{safe_work_title}.txt")
-        with open(intro_filename, "w", encoding="utf-8") as out_f:
-            out_f.write(intro_content)
-        created_files.append(intro_filename)
-        print(f"  [+] Created Intro: {intro_filename}")
+            print(f"  [*] Preserved existing intro for '{safe_work_title}'.")
 
         # --- 2. Chapter by Chapter Processing ---
         trailing_session_state = {}
-        track_counter = 1
+        track_counter = base_track
         for i, ch_info in enumerate(valid_splits):
             start_pos = ch_info["start"]
-            end_pos = valid_splits[i + 1]["start"] if i + 1 < len(valid_splits) else len(raw_text)
+            end_pos = ch_info.get("end", len(raw_text))
 
             chapter_raw = raw_text[start_pos:end_pos].strip()
             chapter_header = ch_info["header"]
@@ -599,6 +918,21 @@ def parse_book_file(
             if should_unwrap:
                 body_text = unwrap_hard_wraps(body_text)
 
+            # Compute sequential chapter number if appending
+            raw_chap_num = ch_info["num"]
+            if safe_target_book and base_chap >= 1 and raw_chap_num <= base_chap:
+                computed_chap_num = base_chap + i + 1
+            else:
+                computed_chap_num = raw_chap_num
+
+            if computed_chap_num != raw_chap_num:
+                if re.search(r"\bchapter\s+\d+\b", chapter_header, re.IGNORECASE):
+                    chapter_header = re.sub(r"(?i)\bchapter\s+\d+\b", f"Chapter {computed_chap_num}", chapter_header)
+                elif ch_info["title"]:
+                    chapter_header = f"Chapter {computed_chap_num}: {ch_info['title']}"
+                else:
+                    chapter_header = f"Chapter {computed_chap_num}"
+
             # Formatting Rule:
             # Make sure there is a '***' after first line (chapter header) and at end of file.
             # Never 2 '***' in a row.
@@ -606,7 +940,7 @@ def parse_book_file(
             formatted_chapter = normalize_dividers(formatted_chapter)
 
             # Naming convention: 0[#]_Chapter_[#]_[chapter title if available]
-            chap_num_str = str(ch_info["num"])
+            chap_num_str = str(computed_chap_num)
             track_prefix = f"{track_counter:02d}"
 
             if ch_info["title"]:
@@ -621,13 +955,13 @@ def parse_book_file(
 
             created_files.append(chapter_path)
             track_counter += 1
-            print(f"  [+] Parsed {ch_info['header']} -> {chapter_file_base}")
+            print(f"  [+] Parsed {chapter_header} -> {chapter_file_base}")
 
     # =========================================================================
     # SCENARIO B: NO CHAPTERS FOUND (SINGLE WORK)
     # =========================================================================
     else:
-        print("[*] No chapters found. Treating as a single continuous work.")
+        print("[*] No chapters found in input file.")
 
         # Step: Make replacements using replacement json
         processed_text = apply_word_replacements(cleaned_raw_text, replacements)
@@ -664,28 +998,52 @@ def parse_book_file(
         if should_unwrap:
             after_author = unwrap_hard_wraps(after_author)
 
-        # Formatting Rule:
-        # Make sure there is a '***' after author (or first line) and at the end of each file.
-        # Never 2 '***' in a row.
-        if author_line:
-            final_content = f"{work_title}\n\n{author_line}\n\n***\n\n{after_author.strip()}\n\n***"
+        if safe_target_book:
+            computed_chap_num = (base_chap + 1) if base_chap >= 1 else 1
+            track_prefix = f"{base_track:02d}"
+            raw_title = clean_file_base[:-4] if clean_file_base.lower().endswith(".txt") else clean_file_base
+            raw_title = re.sub(r"^\d+_", "", raw_title).strip()
+            if raw_title and sanitize_filename(raw_title).lower() != safe_work_title.lower():
+                ch_title = raw_title.replace("_", " ")
+                chapter_header = f"Chapter {computed_chap_num}: {ch_title}"
+                chapter_file_base = f"{track_prefix}_Chapter_{computed_chap_num}_{sanitize_filename(ch_title)}.txt"
+            else:
+                chapter_header = f"Chapter {computed_chap_num}"
+                chapter_file_base = f"{track_prefix}_Chapter_{computed_chap_num}.txt"
+
+            final_content = f"{chapter_header}\n\n***\n\n{after_author.strip()}\n\n***"
+            final_content = normalize_dividers(final_content)
+            output_filename = os.path.join(book_output_dir, chapter_file_base)
+            with open(output_filename, "w", encoding="utf-8") as out_f:
+                out_f.write(final_content)
+            created_files.append(output_filename)
+            print(f"  [+] Saved new chapter to: {output_filename}")
         else:
-            final_content = f"{work_title}\n\n***\n\n{after_author.strip()}\n\n***"
+            # Formatting Rule:
+            # Make sure there is a '***' after author (or first line) and at the end of each file.
+            # Never 2 '***' in a row.
+            if author_line:
+                final_content = f"{work_title}\n\n{author_line}\n\n***\n\n{after_author.strip()}\n\n***"
+            else:
+                final_content = f"{work_title}\n\n***\n\n{after_author.strip()}\n\n***"
 
-        final_content = normalize_dividers(final_content)
+            final_content = normalize_dividers(final_content)
 
-        # Clean, safe, short output filename
-        output_filename = os.path.join(book_output_dir, clean_file_base)
-        with open(output_filename, "w", encoding="utf-8") as out_f:
-            out_f.write(final_content)
+            # Clean, safe, short output filename
+            output_filename = os.path.join(book_output_dir, clean_file_base)
+            with open(output_filename, "w", encoding="utf-8") as out_f:
+                out_f.write(final_content)
 
-        created_files.append(output_filename)
-        print(f"  [+] Saved single work to: {output_filename}")
+            created_files.append(output_filename)
+            print(f"  [+] Saved single work to: {output_filename}")
 
     # Write Manifest
-    with open(MANIFEST_FILE, "w", encoding="utf-8") as mf:
-        for cf in created_files:
-            mf.write(f"{cf}\n")
+    if safe_target_book and existing_info and existing_info.get("existing_manifest_files"):
+        update_manifest_file(created_files, existing_files=existing_info["existing_manifest_files"])
+    else:
+        with open(MANIFEST_FILE, "w", encoding="utf-8") as mf:
+            for cf in created_files:
+                mf.write(f"{cf}\n")
 
     print("\n" + "=" * 60)
     print(f"[+] Successfully parsed {len(created_files)} files into '{book_output_dir}'!")
@@ -694,10 +1052,9 @@ def parse_book_file(
     return created_files
 
 
-def select_input_file():
+def select_input_file(custom_path=None):
     """Lists files in raw_txt and lets the user pick one, or enter a path."""
-    if len(sys.argv) > 1:
-        custom_path = sys.argv[1]
+    if custom_path:
         if os.path.exists(custom_path):
             return custom_path
         print(f"[!] Warning: Specified file '{custom_path}' not found. Falling back to menu.")
@@ -729,36 +1086,78 @@ def main():
     print("         Advanced Book & Chapter Text Parser         ")
     print("=" * 60)
 
-    input_file = select_input_file()
+    parser = argparse.ArgumentParser(description="Advanced Book & Chapter Text Parser")
+    parser.add_argument("input_file", nargs="?", default=None, help="Path to input .txt file")
+    parser.add_argument("--append-to", "--append", "--book", dest="append_to_book", default=None, help="Append chapter(s) to an existing book name")
+    parser.add_argument("--chapters", "--chaps", dest="select_chapters", default=None, help="Specific chapter numbers or ranges to process/append (e.g. '5', '5-8', '5+').")
+    parser.add_argument("--only-new", action="store_true", default=None, help="When appending an updated full work, automatically extract only newly posted chapters")
+    parser.add_argument("--all-chapters", action="store_true", default=False, help="Force extracting all chapters even if previous chapters exist")
+    parser.add_argument("--multi-nl", action="store_true", help="Convert multiple consecutive newlines to dividers (***)")
+    parser.add_argument("--unwrap", action="store_true", help="Unwrap hard-wrapped single-line paragraph splits")
+    parser.add_argument("--trailing", choices=["none", "interactive", "bulk"], default=None, help="Trailing section cut mode")
+    parser.add_argument("--bulk-cut", type=int, default=1, help="Number of trailing sections to cut per chapter in bulk mode")
+    parser.add_argument("--no-tag", action="store_true", help="Skip dialogue tagging prompt")
+    parser.add_argument("--tag", action="store_true", help="Automatically trigger dialogue tagging")
+    args = parser.parse_args()
+
+    input_file = select_input_file(args.input_file)
     replacements = load_replacements()
 
+    existing_books = get_existing_books(OUTPUT_DIR, TAGGED_DIR, FINISHED_DIR)
+    append_to_book = None
+
+    if args.append_to_book:
+        resolved = resolve_book_name(args.append_to_book, existing_books)
+        append_to_book = resolved if resolved else sanitize_filename(args.append_to_book)
+        print(f"[*] Target book (from argument): '{append_to_book}'")
+    else:
+        print("\nTarget book destination:")
+        print("  [1] Create a new book [Default]")
+        print("  [2] Add chapter(s) to an existing book (select from list or enter title)")
+        dest_choice = input("Select option [1 or 2] (default 1): ").strip()
+        if dest_choice == "2":
+            append_to_book = interactive_select_existing_book(existing_books)
+            print(f"[*] Appending to existing book: '{append_to_book}'")
+
     # Prompt 1: Turn more than one new line in a row to '***'
-    multi_nl_choice = input("\nDo you want to turn more than one new line in a row into '***'? [y/n] (default 'n'): ").strip().lower()
-    should_convert_multi_nl = multi_nl_choice == "y"
+    if args.multi_nl:
+        should_convert_multi_nl = True
+    else:
+        multi_nl_choice = input("\nDo you want to turn more than one new line in a row into '***'? [y/n] (default 'n'): ").strip().lower()
+        should_convert_multi_nl = multi_nl_choice == "y"
 
     # Prompt 2: Hard wrap healing
-    unwrap_choice = input("\nDo you want to fix hard-wrapped single-line paragraph splits? [y/n] (default 'n'): ").strip().lower()
-    should_unwrap = unwrap_choice == "y"
+    if args.unwrap:
+        should_unwrap = True
+    else:
+        unwrap_choice = input("\nDo you want to fix hard-wrapped single-line paragraph splits? [y/n] (default 'n'): ").strip().lower()
+        should_unwrap = unwrap_choice == "y"
 
     # Prompt 3: Trailing sections cutting
-    print("\nTrailing sections cutting (e.g. author notes at the end of chapters):")
-    print("  [0] Keep all sections (no cut)")
-    print("  [1] Review chapter-by-chapter (shows excerpt before cutting)")
-    print("  [2] Bulk cut (cut the same number from all chapters)")
-    trailing_choice = input("Select option [0, 1, or 2] (default 0): ").strip()
+    if args.trailing:
+        trailing_mode = args.trailing
+        bulk_cut_count = args.bulk_cut
+    else:
+        print("\nTrailing sections cutting (e.g. author notes at the end of chapters):")
+        print("  [0] Keep all sections (no cut)")
+        print("  [1] Review chapter-by-chapter (shows excerpt before cutting)")
+        print("  [2] Bulk cut (cut the same number from all chapters)")
+        trailing_choice = input("Select option [0, 1, or 2] (default 0): ").strip()
 
-    trailing_mode = "none"
-    bulk_cut_count = 0
+        trailing_mode = "none"
+        bulk_cut_count = 0
 
-    if trailing_choice == "1":
-        trailing_mode = "interactive"
-    elif trailing_choice == "2":
-        trailing_mode = "bulk"
-        count_input = input("How many trailing sections to cut from each chapter? (1 or 2, default 1): ").strip()
-        try:
-            bulk_cut_count = int(count_input) if count_input else 1
-        except ValueError:
-            bulk_cut_count = 1
+        if trailing_choice == "1":
+            trailing_mode = "interactive"
+        elif trailing_choice == "2":
+            trailing_mode = "bulk"
+            count_input = input("How many trailing sections to cut from each chapter? (1 or 2, default 1): ").strip()
+            try:
+                bulk_cut_count = int(count_input) if count_input else 1
+            except ValueError:
+                bulk_cut_count = 1
+
+    only_new = False if args.all_chapters else (True if args.only_new else None)
 
     created_files = parse_book_file(
         input_file_path=input_file,
@@ -767,13 +1166,16 @@ def main():
         should_unwrap=should_unwrap,
         trailing_mode=trailing_mode,
         bulk_cut_count=bulk_cut_count,
+        append_to_book=append_to_book,
+        only_new=only_new,
+        select_chapters=args.select_chapters,
     )
 
-    if created_files:
+    if created_files and not args.no_tag:
         print("\n" + "=" * 60)
         print("                 AI Dialogue Tagging Option")
         print("=" * 60)
-        tag_choice = input("Do you want to run the Dialogue Tagger on these chapters now? [y/n] (default 'n'): ").strip().lower()
+        tag_choice = "y" if args.tag else input("Do you want to run the Dialogue Tagger on these chapters now? [y/n] (default 'n'): ").strip().lower()
         if tag_choice == "y":
             print("\nSelect dialogue tagging mode:")
             print("  [1] Fast Smart Parser (Instant, 100% quote coverage, zero GPU wait) [Recommended]")
@@ -798,9 +1200,7 @@ def main():
                     detect_tone=detect_tone
                 )
                 if tagged_files:
-                    with open(MANIFEST_FILE, "w", encoding="utf-8") as mf:
-                        for tf in tagged_files:
-                            mf.write(f"{tf}\n")
+                    update_manifest_file(tagged_files)
                     print(f"\n[✓] Updated manifest '{MANIFEST_FILE}' to point to {len(tagged_files)} tagged chapter(s).")
                     print("[✓] Voice mappings synchronized in 'tag_mappings.json' and 'characters.json'.")
                     print("\nYou can now run the audiobook converter directly:")

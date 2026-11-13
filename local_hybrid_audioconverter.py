@@ -2333,9 +2333,13 @@ def convert_audiobook(
             if tag != canon:
                 safe_print(f"  - Tag [{tag}] maps to character [{canon}]")
 
-    first_file_base = os.path.splitext(os.path.basename(chapter_files[0]))[0]
-    cleaned_first = re.sub(r"^\d+_", "", first_file_base)
-    book_title_base = re.sub(r"^intro_", "", cleaned_first)
+    parent_dir = os.path.basename(os.path.dirname(chapter_files[0]))
+    if parent_dir and parent_dir.lower() not in ("parsed_chapters", "tagged_chapters", "raw_txt", ".", ""):
+        book_title_base = parent_dir
+    else:
+        first_file_base = os.path.splitext(os.path.basename(chapter_files[0]))[0]
+        cleaned_first = re.sub(r"^\d+_", "", first_file_base)
+        book_title_base = re.sub(r"^intro_", "", cleaned_first)
 
     master_output_dir = f"{book_title_base}_hybrid_audiobook_output"
 

@@ -786,6 +786,35 @@ def batch_tag_files(file_paths, dialogue_format="prose", model=DEFAULT_MODEL, ur
     return created_tagged_files
 
 
+def update_manifest_file(new_files, manifest_file=MANIFEST_FILE):
+    """
+    Updates manifest_file, preserving existing chapters and replacing
+    matching basenames (e.g. replacing parsed chapter with tagged chapter) or appending new chapters.
+    """
+    current_lines = []
+    if os.path.exists(manifest_file):
+        with open(manifest_file, "r", encoding="utf-8") as mf:
+            current_lines = [l.strip() for l in mf if l.strip() and not l.startswith("#")]
+
+    tagged_map = {os.path.basename(f): f for f in new_files}
+    final_list = []
+    for line in current_lines:
+        base = os.path.basename(line)
+        if base in tagged_map:
+            final_list.append(tagged_map.pop(base))
+        else:
+            final_list.append(line)
+
+    for remaining in tagged_map.values():
+        if remaining not in final_list:
+            final_list.append(remaining)
+
+    with open(manifest_file, "w", encoding="utf-8") as mf:
+        for f in final_list:
+            mf.write(f"{f}\n")
+    return final_list
+
+
 # ==================== INTERACTIVE CLI ====================
 
 def select_input_files():
@@ -916,10 +945,8 @@ def main():
         print("\nManifest Update:")
         update_manifest = input("Update 'chapters.txt' to point to these newly tagged files? [y/n] (default 'y'): ").strip().lower()
         if update_manifest != "n":
-            with open(MANIFEST_FILE, "w", encoding="utf-8") as mf:
-                for tf in tagged_files:
-                    mf.write(f"{tf}\n")
-            print(f"[✓] Updated '{MANIFEST_FILE}' with {len(tagged_files)} tagged file(s).")
+            update_manifest_file(tagged_files, MANIFEST_FILE)
+            print(f"[✓] Updated '{MANIFEST_FILE}' with {len(tagged_files)} tagged file(s) (preserved all existing chapters).")
 
     print("\nNext steps:")
     print(f"1. Open '{TAG_MAPPINGS_FILE}' if you want to alias any nicknames to specific characters.")
