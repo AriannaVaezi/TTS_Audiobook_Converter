@@ -94,12 +94,23 @@ def ingest_input_source(
 
     # Case 2: Local File Path
     if not os.path.exists(source):
-        # Check if the filename exists inside raw_txt/ directly
+        # Check if the filename exists inside raw_txt/ directly or matches a prefix
         candidate = os.path.join(RAW_TXT_DIR, source)
         if os.path.exists(candidate):
             source = candidate
+        elif os.path.exists(candidate + ".txt"):
+            source = candidate + ".txt"
         else:
-            raise FileNotFoundError(f"Input file or URL not found: '{source}'")
+            q_norm = source.lower().replace(" ", "_")
+            matches = [
+                os.path.join(RAW_TXT_DIR, f)
+                for f in os.listdir(RAW_TXT_DIR)
+                if f.lower().endswith(".txt") and f.lower().replace(" ", "_").startswith(q_norm)
+            ]
+            if matches:
+                source = sorted(matches, key=lambda p: os.path.getmtime(p), reverse=True)[0]
+            else:
+                raise FileNotFoundError(f"Input file or URL not found: '{source}'")
 
     ext = os.path.splitext(source)[1].lower()
 
@@ -513,7 +524,7 @@ def main():
         "--trailing",
         dest="trailing_mode",
         choices=["none", "interactive", "bulk"],
-        default="none",
+        default=None,
         help="Trailing sections cutting mode for author notes (default: 'none').",
     )
     parser.add_argument(
@@ -526,14 +537,14 @@ def main():
         "--cut-start-paragraphs", "--cut-start",
         dest="cut_start_paragraphs",
         type=int,
-        default=0,
+        default=None,
         help="Cut N paragraphs from the beginning of each chapter/work (excluding title + author).",
     )
     parser.add_argument(
         "--cut-end-paragraphs", "--cut-end",
         dest="cut_end_paragraphs",
         type=int,
-        default=0,
+        default=None,
         help="Cut N paragraphs from the end of each chapter/work.",
     )
     parser.add_argument(
@@ -561,7 +572,7 @@ def main():
         "--unwrap",
         dest="unwrap",
         action="store_true",
-        default=False,
+        default=None,
         help="Heal hard-wrapped lines into continuous paragraphs.",
     )
     parser.add_argument(
@@ -574,7 +585,7 @@ def main():
         "--multi-nl",
         dest="multi_nl",
         action="store_true",
-        default=False,
+        default=None,
         help="Convert multiple consecutive blank lines into '***' scene divider pauses.",
     )
     parser.add_argument(
@@ -814,6 +825,15 @@ def main():
             print("[!] No input source provided. Exiting.")
             sys.exit(0)
 
+    review_start_paragraphs = bool(args.review_start_paragraphs or args.review_both_paragraphs)
+    review_end_paragraphs = bool(args.review_end_paragraphs or args.review_both_paragraphs)
+    cut_start_paragraphs = args.cut_start_paragraphs
+    cut_end_paragraphs = args.cut_end_paragraphs
+    trailing_mode = args.trailing_mode
+    bulk_cut = args.bulk_cut
+    unwrap = args.unwrap
+    multi_nl = args.multi_nl
+
     if is_interactive:
         print("\nPipeline Configuration (Press Enter for recommended defaults):")
         if args.tag_dialogue is None:
@@ -823,13 +843,69 @@ def main():
             tag_dialogue = args.tag_dialogue
 
         if args.enable_emotions is None:
-            emo_ans = input("  Enable tone & emotion modulation? [Y/n] (default Y): ").strip().lower()
-            enable_emotions = (emo_ans != "n")
+            if tag_dialogue:
+                emo_ans = input("  Enable tone & emotion modulation? [Y/n] (default Y): ").strip().lower()
+                enable_emotions = (emo_ans != "n")
+            else:
+                enable_emotions = False
         else:
             enable_emotions = args.enable_emotions
+
+        if multi_nl is None:
+            mnl_ans = input("  Convert multiple blank lines into '***' scene dividers? [y/N] (default N): ").strip().lower()
+            multi_nl = (mnl_ans == "y")
+
+        if unwrap is None:
+            unw_ans = input("  Unwrap hard-wrapped lines into continuous paragraphs? [y/N] (default N): ").strip().lower()
+            unwrap = (unw_ans == "y")
+
+        if trailing_mode is None:
+            tr_ans = input("  Cut trailing '***' sections (e.g. AO3 end notes)? [1=No (default), 2=Interactive, 3=Bulk]: ").strip()
+            if tr_ans == "2":
+                trailing_mode = "interactive"
+            elif tr_ans == "3":
+                trailing_mode = "bulk"
+                if not bulk_cut:
+                    raw_bc = input("    How many trailing sections to cut per chapter? [1-9] (default 1): ").strip()
+                    bulk_cut = int(raw_bc) if raw_bc.isdigit() and int(raw_bc) > 0 else 1
+            else:
+                trailing_mode = "none"
+
+        if (
+            cut_start_paragraphs is None
+            and cut_end_paragraphs is None
+            and not review_start_paragraphs
+            and not review_end_paragraphs
+        ):
+            p_ans = input("  Trim opening/closing paragraphs (e.g. author's notes)? [1=No (default), 2=Interactive review, 3=Bulk cut]: ").strip()
+            if p_ans == "2":
+                 side_ans = input("    Review which paragraphs? [1=Both (default), 2=Opening only, 3=Closing only]: ").strip()
+                 if side_ans == "2":
+                     review_start_paragraphs = True
+                 elif side_ans == "3":
+                     review_end_paragraphs = True
+                 else:
+                     review_start_paragraphs = True
+                     review_end_paragraphs = True
+            elif p_ans == "3":
+                raw_s = input("    Number of paragraphs to cut from the start (default 0): ").strip()
+                raw_e = input("    Number of paragraphs to cut from the end (default 0): ").strip()
+                cut_start_paragraphs = int(raw_s) if raw_s.isdigit() else 0
+                cut_end_paragraphs = int(raw_e) if raw_e.isdigit() else 0
+            else:
+                cut_start_paragraphs = 0
+                cut_end_paragraphs = 0
+        else:
+            cut_start_paragraphs = 0 if cut_start_paragraphs is None else cut_start_paragraphs
+            cut_end_paragraphs = 0 if cut_end_paragraphs is None else cut_end_paragraphs
     else:
         tag_dialogue = True if args.tag_dialogue is None else args.tag_dialogue
-        enable_emotions = True if args.enable_emotions is None else args.enable_emotions
+        enable_emotions = (False if not tag_dialogue else True) if args.enable_emotions is None else args.enable_emotions
+        multi_nl = False if multi_nl is None else multi_nl
+        unwrap = False if unwrap is None else unwrap
+        trailing_mode = "none" if trailing_mode is None else trailing_mode
+        cut_start_paragraphs = 0 if cut_start_paragraphs is None else cut_start_paragraphs
+        cut_end_paragraphs = 0 if cut_end_paragraphs is None else cut_end_paragraphs
 
     existing_books = ntp.get_existing_books(ntp.OUTPUT_DIR, ldt.DEFAULT_OUTPUT_DIR, FINISHED_DIR)
     append_to_book = None
@@ -853,10 +929,10 @@ def main():
         tag_dialogue=tag_dialogue,
         tag_mode=args.tag_mode,
         enable_emotions=enable_emotions,
-        trailing_mode=args.trailing_mode,
-        bulk_cut_count=args.bulk_cut,
-        should_unwrap=args.unwrap,
-        should_convert_multi_nl=args.multi_nl,
+        trailing_mode=trailing_mode,
+        bulk_cut_count=bulk_cut,
+        should_unwrap=unwrap,
+        should_convert_multi_nl=multi_nl,
         skip_audio=args.skip_audio,
         interactive=is_interactive,
         normalize_volume=args.normalize_volume,
@@ -893,10 +969,10 @@ def main():
         storage_state_file=args.storage_state_file,
         interactive_login=args.interactive_login,
         visible_browser=args.visible_browser,
-        cut_start_paragraphs=args.cut_start_paragraphs,
-        cut_end_paragraphs=args.cut_end_paragraphs,
-        review_start_paragraphs=bool(args.review_start_paragraphs or args.review_both_paragraphs),
-        review_end_paragraphs=bool(args.review_end_paragraphs or args.review_both_paragraphs),
+        cut_start_paragraphs=cut_start_paragraphs,
+        cut_end_paragraphs=cut_end_paragraphs,
+        review_start_paragraphs=review_start_paragraphs,
+        review_end_paragraphs=review_end_paragraphs,
     )
 
 

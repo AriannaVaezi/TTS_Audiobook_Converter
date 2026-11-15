@@ -160,23 +160,41 @@ def cut_note_pointer_and_lines_above(text_after_header):
     """
     If 'See the end of the chapter for notes' (or variations) is found,
     cuts from the start of the body up to and including that note line.
+    Also strips AO3's leading 'Chapter Text' or 'Work Text:' marker (and any
+    chapter preamble/notes above it).
     """
-    match = NOTE_POINTER_REGEX.search(text_after_header)
+    text = text_after_header.strip()
+    match = NOTE_POINTER_REGEX.search(text)
     if match:
-        cut_end_pos = match.end()
-        # Return everything after the note pointer line
-        return text_after_header[cut_end_pos:].strip()
-    return text_after_header.strip()
+        text = text[match.end():].strip()
+
+    # Strip leading AO3 'Chapter Text' / 'Work Text:' header (and any beginning notes above it)
+    ct_match = re.search(r"(?im)^\s*(?:Chapter\s+Text|Work\s+Text)\s*:?\s*$", text)
+    if ct_match and ct_match.start() < 2500:
+        text = text[ct_match.end():].strip()
+
+    return text
 
 
 def cut_end_notes(text):
     """
-    If 'Afterword', 'Chapter End Notes', or 'End Notes' is found on a line,
-    cuts that line and everything following it.
+    If 'Afterword', 'Chapter End Notes', 'End Notes', or a standalone 'Notes:' section
+    header is found at the end of a chapter/work, cuts that line and everything following it.
     """
+    matches = list(
+        re.finditer(
+            r"(?im)^\s*(?:Afterword|Chapter\s+End\s+Notes|End\s+Notes|Notes\s*:)\s*$",
+            text,
+        )
+    )
+    if matches:
+        last_m = matches[-1]
+        if text[: last_m.start()].strip():
+            return text[: last_m.start()].strip()
+
     match = re.search(r"(?im)^\s*(?:Afterword|Chapter\s+End\s+Notes|End\s+Notes)\b", text)
-    if match:
-        return text[:match.start()].strip()
+    if match and text[: match.start()].strip():
+        return text[: match.start()].strip()
     return text.strip()
 
 
@@ -366,13 +384,15 @@ def cut_paragraphs_bulk(body_text, start_count=0, end_count=0):
 
 def cut_leading_paragraphs_interactive(body_text, chapter_label="", session_state=None):
     """
-    Interactively reviews paragraphs at the beginning of a chapter/work body
-    (excluding title, author, and chapter header) so the user can cut pre-story
-    author's notes, summaries, or tags one paragraph at a time.
+    Interactively walks through paragraphs at the beginning of a chapter/work body
+    (excluding the main title/author header block).
+    Keeping a paragraph ('n') preserves it (e.g. an in-body subtitle/date/header)
+    and advances to inspect the next paragraph until the user stops ('q'/'s'/Enter on stop).
     Supports:
-      [y] Cut this opening paragraph (then shows the next opening paragraph)
-      [n] Keep & start story here (default)
-      [1-9] Cut N opening paragraphs at once
+      [y] Cut this paragraph (and advance to the next paragraph)
+      [n] Keep this paragraph and advance to the next paragraph
+      [q / d / Enter] Stop reviewing opening paragraphs (keep this & all remaining)
+      [1-9] Cut N paragraphs starting at this position
       [a] Cut 1 opening paragraph from this & all remaining chapters
       [s] Skip / keep opening paragraphs in all remaining chapters
     """
@@ -388,63 +408,80 @@ def cut_leading_paragraphs_interactive(body_text, chapter_label="", session_stat
     if len(paras) <= 1:
         return body_text
 
-    while len(paras) > 1:
-        while paras and paras[0] == "***":
-            paras.pop(0)
-        if len(paras) <= 1:
+    kept_prefix = []
+    idx = 0
+    while len(kept_prefix) + (len(paras) - idx) > 1 and idx < len(paras):
+        if paras[idx] == "***":
+            # Only preserve a divider if we have already kept at least one paragraph before it
+            if kept_prefix and kept_prefix[-1] != "***":
+                kept_prefix.append("***")
+            idx += 1
+            continue
+
+        remaining_real = len([p for p in paras[idx:] if p != "***"])
+        if len([p for p in kept_prefix if p != "***"]) + remaining_real <= 1:
             break
 
-        first_para = paras[0]
-        excerpt_len = min(300, len(first_para))
-        excerpt = first_para[:excerpt_len].replace("\n", " ").strip()
-        if len(first_para) > excerpt_len:
+        curr_para = paras[idx]
+        excerpt_len = min(300, len(curr_para))
+        excerpt = curr_para[:excerpt_len].replace("\n", " ").strip()
+        if len(curr_para) > excerpt_len:
             excerpt += "..."
 
+        pos_num = len([p for p in kept_prefix if p != "***"]) + 1
         print("\n" + "=" * 70)
-        print(f"[{chapter_label}] Opening Paragraph Review ({len(paras)} paragraphs remaining)")
-        print(f"Opening paragraph ({len(first_para)} chars):")
+        print(f"[{chapter_label}] Opening Paragraph Review (Paragraph #{pos_num}, {remaining_real} remaining)")
+        print(f"Paragraph ({len(curr_para)} chars):")
         print(f'"{excerpt}"')
         print("-" * 70)
-        print("Options: [y] Cut paragraph | [n] Keep (done) | [1-9] Cut N paragraphs | [a] Cut 1 in all chapters | [s] Skip all chapters")
-        raw_choice = input("Cut this opening paragraph? [y/n/1-9/a/s] (default 'n'): ").strip().lower()
-        choice = raw_choice if raw_choice else "n"
+        print("Options:")
+        print("  [y] Cut this paragraph & check next  | [n / k] Keep this paragraph & check next")
+        print("  [1-9] Cut N paragraphs from here     | [q / d / Enter] Stop (keep this & start story)")
+        print("  [a] Cut 1 in all remaining chapters  | [s] Skip all remaining chapters")
+        raw_choice = input("Action for this paragraph? [y/n/1-9/q/a/s] (default 'q' = stop): ").strip().lower()
+        choice = raw_choice if raw_choice else "q"
 
-        if choice in ("a", "all"):
+        if choice in ("q", "quit", "done", "d", "stop"):
+            print("  [-] Stopped opening review. Keeping this and all following paragraphs.")
+            break
+        elif choice in ("a", "all"):
             session_state["auto_cut_start_count"] = 1
-            paras.pop(0)
-            while paras and paras[0] == "***":
-                paras.pop(0)
-            print("  [+] Cut opening paragraph. Will automatically cut 1 opening paragraph from all remaining chapters.")
+            idx += 1
+            print("  [+] Cut paragraph. Will automatically cut 1 opening paragraph from all remaining chapters.")
             break
         elif choice in ("s", "skip"):
             session_state["auto_keep_start_all"] = True
-            print("  [-] Kept opening paragraph. Will keep opening paragraphs in all remaining chapters.")
+            print("  [-] Stopped opening review. Will keep opening paragraphs in all remaining chapters.")
             break
-        elif choice in ("y", "yes"):
-            paras.pop(0)
-            while paras and paras[0] == "***":
-                paras.pop(0)
-            print(f"  [+] Cut opening paragraph. ({len(paras)} paragraphs remaining)")
+        elif choice in ("y", "yes", "c", "cut"):
+            idx += 1
+            print(f"  [+] Cut paragraph.")
+            continue
+        elif choice in ("n", "no", "k", "keep"):
+            kept_prefix.append(curr_para)
+            idx += 1
+            print(f"  [-] Kept paragraph #{pos_num}; advancing to next paragraph...")
             continue
         elif choice.isdigit() and int(choice) > 0:
             n_to_cut = int(choice)
             cut_done = 0
-            while len(paras) > 1 and cut_done < n_to_cut:
-                while paras and paras[0] == "***":
-                    paras.pop(0)
-                if len(paras) <= 1:
+            while idx < len(paras) and cut_done < n_to_cut:
+                if paras[idx] == "***":
+                    idx += 1
+                    continue
+                rem_after = len([p for p in paras[idx + 1:] if p != "***"])
+                if len([p for p in kept_prefix if p != "***"]) + rem_after < 1:
                     break
-                paras.pop(0)
+                idx += 1
                 cut_done += 1
-            while paras and paras[0] == "***":
-                paras.pop(0)
-            print(f"  [+] Cut {cut_done} opening paragraph(s). ({len(paras)} paragraphs remaining)")
-            break
+            print(f"  [+] Cut {cut_done} paragraph(s); advancing to next paragraph...")
+            continue
         else:
-            print("  [-] Kept opening paragraph.")
+            print("  [-] Stopped opening review. Keeping this and all following paragraphs.")
             break
 
-    return _join_body_paragraphs(paras)
+    final_paras = kept_prefix + paras[idx:]
+    return _join_body_paragraphs(final_paras)
 
 
 def cut_trailing_paragraphs_interactive(body_text, chapter_label="", session_state=None):
@@ -570,6 +607,39 @@ def clean_web_fiction_header_and_metadata(raw_text, input_file_path):
             work_title = re.sub(r"\[.*?\]+", "", raw_t).strip()
             author = ellipsus_m.group(2).strip()
 
+    # Pattern B2: Tumblr: "(1) Title - @author on Tumblr" or "(1) @author on Tumblr"
+    tumblr_title_m = re.match(
+        r"^(?:\(\d+\)\s*)?(.+?)\s+[-–—|]\s+@?([a-zA-Z0-9_\-]+)\s+on\s+Tumblr\s*$",
+        first_line,
+        re.IGNORECASE,
+    )
+    tumblr_author_m = (
+        None
+        if tumblr_title_m
+        else re.match(
+            r"^(?:\(\d+\)\s*)?(?:Post\s+by\s+)?@?([a-zA-Z0-9_\-]+)\s+on\s+Tumblr\s*$",
+            first_line,
+            re.IGNORECASE,
+        )
+    )
+    is_tumblr = bool(tumblr_title_m or tumblr_author_m)
+    if tumblr_title_m and not work_title:
+        raw_t = tumblr_title_m.group(1).strip()
+        work_title = re.sub(r"^[〈《「『【\[\(]+\s*|\s*[〉》」』】\]\)]+$", "", raw_t).strip() or raw_t
+        author = tumblr_title_m.group(2).strip()
+    elif tumblr_author_m and not work_title:
+        author = tumblr_author_m.group(1).strip()
+        cand_idx = 1
+        if len(lines) > cand_idx and lines[cand_idx].lstrip("@").strip().lower() == author.lower():
+            cand_idx += 1
+        if len(lines) > cand_idx:
+            cand = lines[cand_idx].strip()
+            if (
+                0 < len(cand) <= 100
+                and not re.match(r"^(?:pairing|word\s*count|summary|warnings?|tags?|a/?n|notes?)\b", cand, re.IGNORECASE)
+            ):
+                work_title = re.sub(r"^[〈《「『【\[\(]+\s*|\s*[〉》」』】\]\)]+$", "", cand).strip() or cand
+
     # Pattern C: FicHub / Standard: "Title" then "By: Author"
     if not work_title:
         by_m = re.search(r"(?im)^\s*(?:By:\s*|by\s+)([a-zA-Z0-9_\.\-]+(?:\s+[a-zA-Z0-9_\.\-]+){0,3})\s*$", raw_text)
@@ -594,10 +664,27 @@ def clean_web_fiction_header_and_metadata(raw_text, input_file_path):
     body_text = raw_text
 
     # Strip top platform metadata header (e.g. Title - Author - Fandom/Tags) so it never leaks into story content
-    if first_line and (ao3_m or is_ellipsus or (work_title and work_title in first_line and "-" in first_line)):
+    if first_line and (ao3_m or is_ellipsus or is_tumblr or (work_title and work_title in first_line and "-" in first_line)):
         first_line_end = body_text.find("\n")
         if first_line_end != -1:
             body_text = body_text[first_line_end + 1:].strip()
+            if is_tumblr:
+                if author:
+                    body_text = re.sub(
+                        rf"^\s*@?{re.escape(author)}\s*(?:\n+|$)",
+                        "",
+                        body_text,
+                        count=1,
+                        flags=re.IGNORECASE,
+                    ).strip()
+                if work_title:
+                    body_text = re.sub(
+                        rf"^\s*[〈《「『【\[\(]*\s*{re.escape(work_title)}\s*[〉》」』】\]\)]*\s*(?:\n+|$)",
+                        "",
+                        body_text,
+                        count=1,
+                        flags=re.IGNORECASE,
+                    ).strip()
     elif work_title and first_line.strip().lower() == work_title.strip().lower():
         # Strip leading title + 'by Author' lines from body_text so they aren't duplicated
         # when the parser prepends the Title / Author header block
@@ -1138,7 +1225,8 @@ def parse_book_file(
             # Cut 1: If note pointer found, cut from chapter title up to and including lines above
             body_text = cut_note_pointer_and_lines_above(body_text)
 
-            # End Notes cutting is now handled via interactive review or bulk mode
+            # Cut 2: Cut chapter End Notes / 'Notes:' section at the end of the chapter if present
+            body_text = cut_end_notes(body_text)
 
             # Cut 3: If 'Chapter Summary' or 'Summary' on a line, cut it and next text line
             body_text = cut_summary_and_next_text_line(body_text)
@@ -1234,7 +1322,8 @@ def parse_book_file(
         # Cut 2: If 'Chapter Summary' or 'Summary' on a line, cut it and next text line
         after_author = cut_summary_and_next_text_line(after_author)
 
-        # End Notes cutting is now handled via interactive review or bulk mode
+        # Cut 3: Cut End Notes / 'Notes:' section at the end of the work if present
+        after_author = cut_end_notes(after_author)
 
         # Strip any dangling trailing divider
         after_author = re.sub(r"(?:\n\s*(?:(?:\*\s*){3,}|(?:-\s*){3,}|(?:_\s*){3,}|(?:[—–]\s*){3,})\s*)+$", "", after_author).strip()

@@ -2535,18 +2535,6 @@ def convert_audiobook(
     Renders an audiobook from a chapter manifest using simultaneous CPU Kokoro and GPU F5-TTS.
     Returns True on success, False on error.
     """
-    if enable_emotions is None:
-        if interactive:
-            safe_print("\nDialogue Tone & Emotion Delivery:")
-            safe_print("  [1] Enabled  - Apply tone modulation (whisper, shout, angry, etc.) [Default]")
-            safe_print("  [2] Disabled - Pure baseline voices only (zero speed/pitch distortion)")
-            emo_choice = input("Select option [1 or 2] (default 1): ").strip()
-            enable_emotions = (emo_choice != "2")
-        else:
-            enable_emotions = True
-
-    safe_print(f"[*] Tone & Emotion Mode: {'ENABLED (Acoustic Modulation)' if enable_emotions else 'DISABLED (Pure Baseline)'}")
-
     if not os.path.exists(manifest_file):
         safe_print(f"Error: Could not find manifest file '{manifest_file}'.")
         safe_print(f"Tip: Run 'new_text_parser.py' first to format chapters into '{manifest_file}'.")
@@ -2558,6 +2546,33 @@ def convert_audiobook(
     if not chapter_files:
         safe_print(f"Error: Manifest file '{manifest_file}' is empty.")
         return False
+
+    tag_re = re.compile(
+        r"\[\s*([a-zA-Z0-9_\'\-]+)(?::[a-zA-Z0-9_\'\-]+)?\s*\].*?\[\s*/\s*\1(?::[a-zA-Z0-9_\'\-]+)?\s*\]",
+        re.IGNORECASE | re.DOTALL,
+    )
+    has_speaker_tags = False
+    for fpath in chapter_files:
+        if os.path.exists(fpath):
+            try:
+                with open(fpath, "r", encoding="utf-8") as f:
+                    if tag_re.search(f.read()):
+                        has_speaker_tags = True
+                        break
+            except Exception:
+                pass
+
+    if enable_emotions is None:
+        if interactive and has_speaker_tags:
+            safe_print("\nDialogue Tone & Emotion Delivery:")
+            safe_print("  [1] Enabled  - Apply tone modulation (whisper, shout, angry, etc.) [Default]")
+            safe_print("  [2] Disabled - Pure baseline voices only (zero speed/pitch distortion)")
+            emo_choice = input("Select option [1 or 2] (default 1): ").strip()
+            enable_emotions = (emo_choice != "2")
+        else:
+            enable_emotions = bool(has_speaker_tags)
+
+    safe_print(f"[*] Tone & Emotion Mode: {'ENABLED (Acoustic Modulation)' if enable_emotions else 'DISABLED (Pure Baseline)'}")
 
     # Load character profiles and tag mappings
     characters = load_characters()
@@ -2633,7 +2648,7 @@ def convert_audiobook(
         characters = interactive_adjust_volumes(characters)
 
     if normalize_volume is None:
-        if interactive and not set_volumes and not adjust_volumes:
+        if interactive and has_speaker_tags and not set_volumes and not adjust_volumes:
             safe_print("\nVoice Volume Options:")
             safe_print("  [1] Auto-balanced (recommended, uses per-voice 'volume' multipliers) [Default]")
             safe_print("  [2] Unbalanced / Raw volumes (only applies explicit 'volume' multipliers)")

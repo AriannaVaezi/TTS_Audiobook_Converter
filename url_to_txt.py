@@ -1151,6 +1151,60 @@ def _fetch_url_html_with_playwright(
             except Exception:
                 pass
 
+        # Detect anti-bot / human verification gates first so we don't wait 20s before prompting
+        try:
+            is_challenge = page.evaluate("""
+                () => {
+                    const t = (document.title || '').trim().toLowerCase();
+                    const b = (document.body ? document.body.innerText : '').toLowerCase();
+                    return (
+                        t.startsWith('just a moment') ||
+                        b.includes('shields are up!') ||
+                        b.includes('please prove that you are not a robot')
+                    );
+                }
+            """)
+        except Exception:
+            is_challenge = False
+
+        if is_challenge and not headless and not interactive_login:
+            print("\n" + "=" * 68)
+            print(" [VERIFICATION REQUIRED] Site presented a human-verification screen.")
+            print(" Please complete it directly in the visible browser window,")
+            print(" wait for the story page to appear, and then press Enter here.")
+            print("=" * 68)
+            try:
+                input("Press Enter once the story page is loaded > ")
+            except EOFError:
+                pass
+            try:
+                context.storage_state(path=resolved_state_file)
+                print(f"[✓] Saved browser session to '{resolved_state_file}' for future runs!")
+            except Exception:
+                pass
+            try:
+                is_challenge = page.evaluate("""
+                    () => {
+                        const t = (document.title || '').trim().toLowerCase();
+                        const b = (document.body ? document.body.innerText : '').toLowerCase();
+                        return (
+                            t.startsWith('just a moment') ||
+                            b.includes('shields are up!') ||
+                            b.includes('please prove that you are not a robot')
+                        );
+                    }
+                """)
+            except Exception:
+                is_challenge = False
+
+        if is_challenge:
+            browser.close()
+            raise RuntimeError(
+                "Target site presented a 'Shields are up! / Just a moment...' human-verification challenge.\n"
+                "  • Option 1: If you already have the file in 'raw_txt/', pass that local file path instead of the URL.\n"
+                "  • Option 2: Re-run with `--login` or `--visible` to complete the check yourself in a visible browser window."
+            )
+
         # Wait for initial story paragraphs to hydrate
         print("[*] Waiting for page content to load...")
         try:
