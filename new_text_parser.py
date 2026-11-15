@@ -708,6 +708,9 @@ def clean_web_fiction_header_and_metadata(raw_text, input_file_path):
                     flags=re.IGNORECASE,
                 ).strip()
 
+    # Strip leading standalone source URL line (e.g. exported after title in EPUBs)
+    body_text = re.sub(r"^\s*https?://\S+\s*(?:\n+|$)", "", body_text, count=1).strip()
+
     # Pre-clean AO3 preamble / summary / notes for single works
     if is_ao3 and work_title:
         title_escaped = re.escape(work_title)

@@ -39,6 +39,7 @@ RAW_TXT_DIR = "raw_txt"
 RAW_EPUB_DIR = "raw_epub"
 SUPPORTED_OUTPUT_FORMATS = ("txt", "epub", "both")
 DEFAULT_STORAGE_STATE_FILE = ".playwright_auth.json"
+_LAST_RESOLVED_SOURCE_URL = None
 
 _NO_CONTENT_TAGS = (
     "script", "style", "nav", "header", "footer", "aside", "button",
@@ -85,6 +86,12 @@ h1, h2, h3, h4 {
 }
 p {
   margin: 0.5em 0;
+}
+p.source-url {
+  margin-top: -0.2em;
+  margin-bottom: 1.2em;
+  font-size: 0.9em;
+  word-break: break-all;
 }
 blockquote {
   margin: 1em 1.5em;
@@ -659,6 +666,44 @@ def text_to_epub_chapters(
     return chapters
 
 
+def _inject_source_url_after_title(
+    chapters: list[tuple[str, str]],
+    book_title: str,
+    source_url: str,
+) -> list[tuple[str, str]]:
+    """
+    Inserts a clickable source URL paragraph immediately after the title heading
+    in the first EPUB chapter.
+    """
+    if not source_url or not source_url.strip().lower().startswith(("http://", "https://")) or not chapters:
+        return chapters
+
+    clean_url = _strip_xml_control_chars(source_url.strip())
+    esc_href = html.escape(clean_url, quote=True)
+    esc_label = html.escape(clean_url, quote=False)
+    link_p = f'<p class="source-url"><a href="{esc_href}">{esc_label}</a></p>'
+
+    first_title, first_xhtml = chapters[0]
+    if esc_href in first_xhtml[:600]:
+        return chapters
+
+    safe_book_title = _normalize_ws(book_title) or "Untitled Story"
+    m_h1 = re.match(r"^\s*(<h1\b[^>]*>.*?</h1>)", first_xhtml, flags=re.IGNORECASE | re.DOTALL)
+    if m_h1:
+        updated_first = f"{m_h1.group(1)}\n{link_p}{first_xhtml[m_h1.end():]}"
+    else:
+        m_h2 = re.match(r"^\s*(<h2\b[^>]*>.*?</h2>)", first_xhtml, flags=re.IGNORECASE | re.DOTALL)
+        if m_h2 and _plain_text_from_xhtml(m_h2.group(1)).lower() == safe_book_title.lower():
+            updated_first = f"{m_h2.group(1)}\n{link_p}{first_xhtml[m_h2.end():]}"
+        else:
+            esc_title = html.escape(safe_book_title, quote=False)
+            updated_first = f"<h1>{esc_title}</h1>\n{link_p}\n{first_xhtml}"
+
+    updated = list(chapters)
+    updated[0] = (first_title, updated_first)
+    return updated
+
+
 def write_epub_from_chapters(
     chapters: list[tuple[str, str]],
     output_path: str,
@@ -676,6 +721,7 @@ def write_epub_from_chapters(
 
     safe_title = _normalize_ws(title) or "Untitled Story"
     safe_author = _normalize_ws(author or "")
+    chapters = _inject_source_url_after_title(chapters, safe_title, source_url)
 
     book = epub.EpubBook()
     book.set_identifier(f"url-to-txt-{uuid.uuid4()}")
@@ -909,6 +955,218 @@ def _normalize_tumblr_url(url: str) -> tuple[str, str | None, str | None, str | 
     return url, None, None, None
 
 
+def _is_ao3_url(url: str) -> bool:
+    """Returns True if URL belongs to Archive of Our Own (archiveofourown.org / ao3.org)."""
+    if not url:
+        return False
+    try:
+        host = (urllib.parse.urlparse(url.strip()).netloc or "").lower().split(":")[0]
+    except Exception:
+        return False
+    return (
+        host == "archiveofourown.org"
+        or host.endswith(".archiveofourown.org")
+        or host == "ao3.org"
+        or host.endswith(".ao3.org")
+    )
+
+
+def _ensure_ao3_full_work_url(url: str) -> str:
+    """
+    Ensures an AO3 work URL points to the work root (stripping /chapters/<id>)
+    and includes view_full_work=true while preserving existing query parameters.
+    """
+    if not _is_ao3_url(url):
+        return url
+
+    parsed = urllib.parse.urlparse(url.strip())
+    path = parsed.path or ""
+    if not re.search(r"/works/\d+", path):
+        return url
+
+    new_path = re.sub(r"(/works/\d+)/chapters/\d+/?$", r"\1", path)
+    query_pairs = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+    updated_pairs = []
+    has_full_work = False
+    for k, v in query_pairs:
+        if k == "view_full_work":
+            updated_pairs.append(("view_full_work", "true"))
+            has_full_work = True
+        else:
+            updated_pairs.append((k, v))
+    if not has_full_work:
+        updated_pairs.append(("view_full_work", "true"))
+
+    new_query = urllib.parse.urlencode(updated_pairs)
+    return urllib.parse.urlunparse(
+        (parsed.scheme or "https", parsed.netloc, new_path, parsed.params, new_query, parsed.fragment)
+    )
+
+
+def _ensure_ao3_entire_work_on_page(page, current_url: str) -> str:
+    """
+    On Archive of Our Own work pages:
+      1. Dismisses the adult-content warning interstitial ('Proceed') if shown.
+      2. Clicks the 'Entire Work' button if present (so all chapters load instead
+         of a single chapter).
+      3. For multi-chapter works, ensures the returned source URL includes
+         view_full_work=true.
+    """
+    try:
+        live_url = page.url or current_url
+        on_ao3 = _is_ao3_url(live_url) or _is_ao3_url(current_url) or bool(
+            page.evaluate("() => Boolean(document.querySelector('#workskin, ul.work.navigation.actions'))")
+        )
+    except Exception:
+        on_ao3 = _is_ao3_url(current_url)
+
+    if not on_ao3:
+        return current_url
+
+    # 1. Handle AO3 adult content confirmation gate if still on warning screen
+    try:
+        has_proceed = page.evaluate("""
+            () => {
+                if (document.querySelector('#chapters')) return false;
+                document.querySelectorAll('[data-ao3-proceed-target]').forEach(
+                    el => el.removeAttribute('data-ao3-proceed-target')
+                );
+                const adultLink = document.querySelector('ul.actions a[href*="view_adult=true"], a[href*="view_adult=true"]');
+                if (adultLink) {
+                    adultLink.setAttribute('data-ao3-proceed-target', '1');
+                    return true;
+                }
+                const btns = document.querySelectorAll('ul.actions a, ul.actions button');
+                for (const el of btns) {
+                    const txt = (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                    if (txt === 'proceed' || txt === 'yes, continue') {
+                        el.setAttribute('data-ao3-proceed-target', '1');
+                        return true;
+                    }
+                }
+                return false;
+            }
+        """)
+        if has_proceed:
+            print("[*] AO3 adult content notice detected — clicking 'Proceed'...")
+            try:
+                page.locator('[data-ao3-proceed-target="1"]').first.click(timeout=5000)
+            except Exception:
+                page.evaluate("() => { const el = document.querySelector('[data-ao3-proceed-target=\"1\"]'); if (el) el.click(); }")
+            try:
+                page.wait_for_load_state("networkidle", timeout=20000)
+            except Exception:
+                page.wait_for_timeout(1500)
+            try:
+                page.wait_for_function("document.querySelectorAll('p').length > 3", timeout=15000)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # 2. Check for 'Entire Work' button and click it if not already in full-work view
+    clicked_entire = False
+    try:
+        entire_info = page.evaluate("""
+            () => {
+                document.querySelectorAll('[data-ao3-entire-target]').forEach(
+                    el => el.removeAttribute('data-ao3-entire-target')
+                );
+                const isVisible = (el) => {
+                    const r = el.getBoundingClientRect();
+                    return r.width > 0 && r.height > 0;
+                };
+                const direct = document.querySelector('li.chapter.entire a');
+                if (direct) {
+                    direct.setAttribute('data-ao3-entire-target', '1');
+                    return { found: true, href: direct.getAttribute('href') || '' };
+                }
+                const candidates = document.querySelectorAll('ul.work.navigation.actions a, ul.actions a, a, button');
+                for (const el of candidates) {
+                    const txt = (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                    if (txt === 'entire work' && isVisible(el)) {
+                        el.setAttribute('data-ao3-entire-target', '1');
+                        return { found: true, href: el.getAttribute('href') || '' };
+                    }
+                }
+                return { found: false, href: '' };
+            }
+        """)
+    except Exception:
+        entire_info = {"found": False, "href": ""}
+
+    if isinstance(entire_info, dict) and entire_info.get("found"):
+        clicked_entire = True
+        print("[*] Clicking AO3 'Entire Work' button to load all chapters...")
+        prev_url = page.url or current_url
+        try:
+            page.locator('[data-ao3-entire-target="1"]').first.click(timeout=10000)
+            try:
+                page.wait_for_load_state("networkidle", timeout=30000)
+            except Exception:
+                page.wait_for_timeout(1500)
+        except Exception:
+            pass
+
+        # Fallback: if click did not navigate to full-work view, navigate directly to button href
+        raw_href = (entire_info.get("href") or "").strip()
+        if raw_href and (page.url == prev_url and "view_full_work=true" not in (page.url or "").lower()):
+            target_full_url = _ensure_ao3_full_work_url(urllib.parse.urljoin(prev_url, raw_href))
+            try:
+                page.goto(target_full_url, wait_until="networkidle", timeout=40000)
+            except Exception:
+                pass
+
+        try:
+            page.wait_for_function(
+                "document.querySelectorAll('#chapters .chapter, p').length > 3",
+                timeout=20000,
+            )
+        except Exception:
+            pass
+
+    # 3. Inspect AO3 metadata/DOM to determine whether this is a multi-chapter work
+    try:
+        ao3_meta = page.evaluate("""
+            () => {
+                document.querySelectorAll('[data-ao3-entire-target], [data-ao3-proceed-target]').forEach(el => {
+                    el.removeAttribute('data-ao3-entire-target');
+                    el.removeAttribute('data-ao3-proceed-target');
+                });
+                const hasByChapter = Boolean(document.querySelector('li.chapter.bychapter'));
+                const chapContainers = document.querySelectorAll('#chapters > .chapter, #chapters [id^="chapter-"]').length;
+                const ddChap = document.querySelector('dd.chapters');
+                const ddText = ddChap ? (ddChap.innerText || ddChap.textContent || '').trim() : '';
+                let isMultiFromMeta = false;
+                const m = ddText.match(/^(\\d+)\\s*\\/\\s*(\\d+|\\?)/);
+                if (m) {
+                    const cur = parseInt(m[1], 10);
+                    const tot = m[2] === '?' ? 2 : parseInt(m[2], 10);
+                    if (cur > 1 || tot > 1) isMultiFromMeta = true;
+                }
+                const hasNextChapBtn = Boolean(
+                    document.querySelector('li.chapter.next, li.chapter.previous, #chapter_index, select#selected_id')
+                );
+                return { hasByChapter, chapContainers, isMultiFromMeta, hasNextChapBtn };
+            }
+        """)
+    except Exception:
+        ao3_meta = {}
+
+    final_url = page.url or current_url
+    is_multi_chapter = clicked_entire or bool(
+        isinstance(ao3_meta, dict) and (
+            ao3_meta.get("hasByChapter")
+            or ao3_meta.get("chapContainers", 0) > 1
+            or ao3_meta.get("isMultiFromMeta")
+            or ao3_meta.get("hasNextChapBtn")
+        )
+    )
+    if is_multi_chapter:
+        return _ensure_ao3_full_work_url(final_url)
+    return final_url
+
+
 def _load_cookies_from_file(cookie_path: str) -> list[dict]:
     """
     Loads cookies from either a Netscape cookies.txt file or a JSON cookie export
@@ -1061,6 +1319,24 @@ def _dismiss_tumblr_walls_and_check_login(page) -> bool:
         return False
 
 
+def _detect_human_challenge(page) -> bool:
+    """Returns True if the current page displays an anti-bot verification gate."""
+    try:
+        return bool(page.evaluate("""
+            () => {
+                const t = (document.title || '').trim().toLowerCase();
+                const b = (document.body ? document.body.innerText : '').toLowerCase();
+                return (
+                    t.startsWith('just a moment') ||
+                    b.includes('shields are up!') ||
+                    b.includes('please prove that you are not a robot')
+                );
+            }
+        """))
+    except Exception:
+        return False
+
+
 def _fetch_url_html_with_playwright(
     url: str,
     reader_mode: bool = False,
@@ -1073,8 +1349,11 @@ def _fetch_url_html_with_playwright(
     Loads a URL with Playwright Chromium and returns
     (extracted_html, raw_page_title, meta_title, meta_author).
     Supports Tumblr URL canonicalization, login wall dismissal, saved storage state,
-    cookie import, and interactive login saving.
+    cookie import, AO3 'Entire Work' / full-work resolution, and interactive login saving.
     """
+    global _LAST_RESOLVED_SOURCE_URL
+    _LAST_RESOLVED_SOURCE_URL = None
+
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
@@ -1152,58 +1431,34 @@ def _fetch_url_html_with_playwright(
                 pass
 
         # Detect anti-bot / human verification gates first so we don't wait 20s before prompting
-        try:
-            is_challenge = page.evaluate("""
-                () => {
-                    const t = (document.title || '').trim().toLowerCase();
-                    const b = (document.body ? document.body.innerText : '').toLowerCase();
-                    return (
-                        t.startsWith('just a moment') ||
-                        b.includes('shields are up!') ||
-                        b.includes('please prove that you are not a robot')
-                    );
-                }
-            """)
-        except Exception:
-            is_challenge = False
+        def _wait_or_raise_if_challenge():
+            is_challenge = _detect_human_challenge(page)
+            if is_challenge and not headless and not interactive_login:
+                print("\n" + "=" * 68)
+                print(" [VERIFICATION REQUIRED] Site presented a human-verification screen.")
+                print(" Please complete it directly in the visible browser window,")
+                print(" wait for the story page to appear, and then press Enter here.")
+                print("=" * 68)
+                try:
+                    input("Press Enter once the story page is loaded > ")
+                except EOFError:
+                    pass
+                try:
+                    context.storage_state(path=resolved_state_file)
+                    print(f"[✓] Saved browser session to '{resolved_state_file}' for future runs!")
+                except Exception:
+                    pass
+                is_challenge = _detect_human_challenge(page)
 
-        if is_challenge and not headless and not interactive_login:
-            print("\n" + "=" * 68)
-            print(" [VERIFICATION REQUIRED] Site presented a human-verification screen.")
-            print(" Please complete it directly in the visible browser window,")
-            print(" wait for the story page to appear, and then press Enter here.")
-            print("=" * 68)
-            try:
-                input("Press Enter once the story page is loaded > ")
-            except EOFError:
-                pass
-            try:
-                context.storage_state(path=resolved_state_file)
-                print(f"[✓] Saved browser session to '{resolved_state_file}' for future runs!")
-            except Exception:
-                pass
-            try:
-                is_challenge = page.evaluate("""
-                    () => {
-                        const t = (document.title || '').trim().toLowerCase();
-                        const b = (document.body ? document.body.innerText : '').toLowerCase();
-                        return (
-                            t.startsWith('just a moment') ||
-                            b.includes('shields are up!') ||
-                            b.includes('please prove that you are not a robot')
-                        );
-                    }
-                """)
-            except Exception:
-                is_challenge = False
+            if is_challenge:
+                browser.close()
+                raise RuntimeError(
+                    "Target site presented a 'Shields are up! / Just a moment...' human-verification challenge.\n"
+                    "  • Option 1: If you already have the file in 'raw_txt/', pass that local file path instead of the URL.\n"
+                    "  • Option 2: Re-run with `--login` or `--visible` to complete the check yourself in a visible browser window."
+                )
 
-        if is_challenge:
-            browser.close()
-            raise RuntimeError(
-                "Target site presented a 'Shields are up! / Just a moment...' human-verification challenge.\n"
-                "  • Option 1: If you already have the file in 'raw_txt/', pass that local file path instead of the URL.\n"
-                "  • Option 2: Re-run with `--login` or `--visible` to complete the check yourself in a visible browser window."
-            )
+        _wait_or_raise_if_challenge()
 
         # Wait for initial story paragraphs to hydrate
         print("[*] Waiting for page content to load...")
@@ -1213,6 +1468,13 @@ def _fetch_url_html_with_playwright(
             )
         except Exception:
             print("[!] Paragraph wait timed out. Proceeding with current content.")
+
+        # On AO3, click 'Entire Work' if present and resolve full-work URL for multi-chapter works
+        prev_target_url = target_url
+        target_url = _ensure_ao3_entire_work_on_page(page, target_url)
+        if target_url != prev_target_url and _is_ao3_url(target_url):
+            _wait_or_raise_if_challenge()
+        _LAST_RESOLVED_SOURCE_URL = target_url
 
         # Check for Tumblr login wall / overlays and try public mobile fallback if needed
         is_tumblr_candidate = "tumblr.com" in target_url.lower() or bool(tumblr_blog)
@@ -1371,6 +1633,12 @@ def _fetch_url_html_with_playwright(
         else:
             extracted_html = page.content()
 
+        if not headless and resolved_state_file:
+            try:
+                context.storage_state(path=resolved_state_file)
+            except Exception:
+                pass
+
         browser.close()
 
     return extracted_html, page_title, meta_title, meta_author
@@ -1493,6 +1761,9 @@ def scrape_url_to_txt(
             plain_text_override=clean_plain,
         )
 
+    global _LAST_RESOLVED_SOURCE_URL
+    _LAST_RESOLVED_SOURCE_URL = None
+
     extracted_html, page_title, meta_title, meta_author = _fetch_url_html_with_playwright(
         url=url,
         reader_mode=reader_mode,
@@ -1501,6 +1772,7 @@ def scrape_url_to_txt(
         storage_state_file=storage_state_file,
         interactive_login=interactive_login,
     )
+    resolved_source_url = _LAST_RESOLVED_SOURCE_URL or url
     resolved_meta_title = title or clean_story_title(meta_title)
     resolved_meta_author = author or meta_author
 
@@ -1511,7 +1783,7 @@ def scrape_url_to_txt(
         meta_author=resolved_meta_author,
         output_name=output_name,
         output_format=fmt,
-        source_url=url,
+        source_url=resolved_source_url,
     )
 
 

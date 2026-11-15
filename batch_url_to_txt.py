@@ -7,11 +7,18 @@ saving all results as .txt files into raw_txt/ and/or .epub files into raw_epub/
 Usage:
   python batch_url_to_txt.py <links_file.txt> [options]
 
-Options:
-  --reader-all       Force Reader Mode for every link regardless of domain.
-  --no-reader        Disable automatic Reader Mode for Ellipsus/Tumblr/AO3 links.
-  --epub             Save outputs as .epub instead of .txt (shorthand for --format epub).
-  --format FORMAT    Output format: txt (default), epub, or both.
+Options (mirrors url_to_txt.py):
+  --reader, --reader-all  Force Reader Mode for every link regardless of domain.
+  --no-reader             Disable automatic Reader Mode for Ellipsus/Tumblr/AO3 links.
+  --visible               Run browser visibly (non-headless) for each URL.
+  --login, --save-login   Open visible browser on first link to log in and save session.
+  --cookies PATH          Netscape cookies.txt or JSON cookies file.
+  --auth-state PATH       Playwright storage state file (default: .playwright_auth.json).
+  --epub                  Save outputs as .epub instead of .txt (shorthand for --format epub).
+  --format FORMAT         Output format: txt (default), epub, or both.
+  --out NAME              Override output filename or directory/path.
+  --title TITLE           Override story/book title metadata for EPUB output.
+  --author AUTHOR         Override author metadata for EPUB output.
 
 Links file format:
   - One URL per line
@@ -24,7 +31,7 @@ Domains that automatically use Reader Mode (unless --no-reader):
 Example:
   python batch_url_to_txt.py my_links.txt
   python batch_url_to_txt.py my_links.txt --reader-all
-  python batch_url_to_txt.py my_links.txt --epub
+  python batch_url_to_txt.py my_links.txt --visible --format epub
 """
 
 import argparse
@@ -53,7 +60,11 @@ def process_links_file(
     txt_file_path: str,
     force_reader: bool = False,
     no_reader: bool = False,
+    visible: bool = False,
     output_format: str = "txt",
+    output_name: str = None,
+    title: str = None,
+    author: str = None,
     cookies_file: str = None,
     storage_state_file: str = None,
     interactive_login: bool = False,
@@ -104,13 +115,18 @@ def process_links_file(
         print("-" * 60)
 
         try:
+            is_login_step = bool(interactive_login and i == 1)
             result_path = scrape_url_to_txt(
                 url=url,
                 reader_mode=use_reader,
+                headless=not (visible or is_login_step),
+                output_name=output_name,
                 output_format=output_format,
+                title=title,
+                author=author,
                 cookies_file=cookies_file,
                 storage_state_file=storage_state_file,
-                interactive_login=(interactive_login and i == 1),
+                interactive_login=is_login_step,
             )
             if result_path and os.path.exists(result_path):
                 success_count += 1
@@ -141,7 +157,7 @@ def process_links_file(
     print("=" * 60)
 
 
-if __name__ == "__main__":
+def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Batch-convert a list of URLs to .txt (raw_txt/) and/or .epub (raw_epub/) files."
     )
@@ -150,9 +166,10 @@ if __name__ == "__main__":
         help="Path to a text file containing one URL per line.",
     )
     parser.add_argument(
-        "--reader-all",
+        "--reader", "--reader-all",
+        dest="reader_all",
         action="store_true",
-        help="Force Reader Mode for every URL.",
+        help="Enable / force Reader Mode for every URL.",
     )
     parser.add_argument(
         "--no-reader",
@@ -160,15 +177,9 @@ if __name__ == "__main__":
         help="Disable automatic Reader Mode for all URLs.",
     )
     parser.add_argument(
-        "--epub",
+        "--visible",
         action="store_true",
-        help="Save outputs as .epub instead of .txt (shorthand for --format epub).",
-    )
-    parser.add_argument(
-        "--format",
-        choices=("txt", "epub", "both"),
-        default=None,
-        help="Output format: txt (default), epub, or both.",
+        help="Run browser visibly (non-headless) for each URL.",
     )
     parser.add_argument(
         "--login", "--save-login",
@@ -190,18 +201,65 @@ if __name__ == "__main__":
         default=None,
         help="Path to Playwright storage state file (default: .playwright_auth.json).",
     )
+    parser.add_argument(
+        "--epub",
+        action="store_true",
+        help="Save outputs as .epub instead of .txt (shorthand for --format epub).",
+    )
+    parser.add_argument(
+        "--format",
+        choices=("txt", "epub", "both"),
+        default=None,
+        help="Output format: txt (default), epub, or both.",
+    )
+    parser.add_argument(
+        "--out",
+        type=str,
+        default=None,
+        help="Override output filename or directory/path (optional .txt/.epub extension).",
+    )
+    parser.add_argument(
+        "--title",
+        type=str,
+        default=None,
+        help="Override book/story title metadata for EPUB exports.",
+    )
+    parser.add_argument(
+        "--author",
+        type=str,
+        default=None,
+        help="Override author metadata for EPUB exports.",
+    )
+    return parser
 
-    args = parser.parse_args()
+
+def main(argv=None):
+    parser = build_arg_parser()
+    args = parser.parse_args(argv)
     if args.epub and args.format == "txt":
         parser.error("--epub cannot be combined with --format txt.")
 
-    selected_format = args.format if args.format is not None else ("epub" if args.epub else "txt")
+    if args.format is not None:
+        selected_format = args.format
+    elif args.epub or (args.out and args.out.strip().lower().endswith(".epub")):
+        selected_format = "epub"
+    else:
+        selected_format = "txt"
+
     process_links_file(
         txt_file_path=args.txt_file,
         force_reader=args.reader_all,
         no_reader=args.no_reader,
+        visible=args.visible,
         output_format=selected_format,
+        output_name=args.out,
+        title=args.title,
+        author=args.author,
         cookies_file=args.cookies_file,
         storage_state_file=args.storage_state_file,
         interactive_login=args.interactive_login,
     )
+
+
+if __name__ == "__main__":
+    main()
