@@ -68,7 +68,7 @@ def sanitize_filename(name):
 
 
 DIVIDER_LINE_REGEX = re.compile(
-    r"^\s*(?:(?:\*\s*){3,}|(?:-\s*){3,}|(?:_\s*){3,}|(?:[—–]\s*){3,})\s*$",
+    r"^[ \t]*(?=\S)(?:[^\w\r\n]|_)+[ \t]*$",
     re.MULTILINE,
 )
 
@@ -77,9 +77,14 @@ def normalize_dividers(text):
     """
     Ensures there is never 2 '***' in a row.
     Collapses multiple consecutive '***' lines into a single '***'.
-    Standardizes * * *, ---, ___, and em-dash dividers into '***'.
+    Standardizes any non-empty line without letters or numbers (-, --, _, ***, etc.) into '***'.
     """
     text = DIVIDER_LINE_REGEX.sub("***", text)
+    text = re.sub(
+        r"(?m)^[ \t]*\*\*\*(?:[ \t]*\r?\n(?:[ \t]*\r?\n)*[ \t]*\*\*\*)+[ \t]*$",
+        "***",
+        text,
+    )
     text = re.sub(r"(?:\n\s*\*\*\*\s*)+", "\n\n***\n\n", text)
     return text.strip()
 
@@ -103,7 +108,7 @@ def unwrap_hard_wraps(text):
     if blocks end with sentence punctuation or if the next block starts with lowercase,
     while safely preserving dialog blocks, short lines, and section dividers.
     """
-    blocks = re.split(r"\n\s*\n", text)
+    blocks = re.split(r"\n\s*\n", normalize_dividers(text))
     merged_paragraphs = []
     current_paragraph = ""
 
@@ -112,9 +117,9 @@ def unwrap_hard_wraps(text):
         if not stripped:
             continue
 
-        # Keep dividers and chapter headers isolated
+        # Keep chapter headers and dividers isolated
         if re.match(
-            r"^(?:Chapter\s+\d+|Chapter\s+\d+\s*[:\-].*|\*\*\*|\—|\-|\–|\.)$",
+            r"^(?:Chapter\s+\d+|Chapter\s+\d+\s*[:\-].*)$",
             stripped,
             re.IGNORECASE,
         ):
@@ -122,6 +127,14 @@ def unwrap_hard_wraps(text):
                 merged_paragraphs.append(current_paragraph)
                 current_paragraph = ""
             merged_paragraphs.append(stripped)
+            continue
+
+        if "\n" not in stripped and DIVIDER_LINE_REGEX.match(stripped):
+            if current_paragraph:
+                merged_paragraphs.append(current_paragraph)
+                current_paragraph = ""
+            if not merged_paragraphs or merged_paragraphs[-1] != "***":
+                merged_paragraphs.append("***")
             continue
 
         if not current_paragraph:
@@ -1234,8 +1247,10 @@ def parse_book_file(
             # Cut 3: If 'Chapter Summary' or 'Summary' on a line, cut it and next text line
             body_text = cut_summary_and_next_text_line(body_text)
 
-            # Strip any dangling trailing divider left after trimming next chapter title
-            body_text = re.sub(r"(?:\n\s*(?:(?:\*\s*){3,}|(?:-\s*){3,}|(?:_\s*){3,}|(?:[—–]\s*){3,})\s*)+$", "", body_text).strip()
+            # Normalize symbol-only divider lines and strip dangling start/end dividers
+            body_text = normalize_dividers(body_text)
+            body_text = re.sub(r"^(?:\*\*\*\s*(?:\n|$))+", "", body_text).strip()
+            body_text = re.sub(r"(?:(?:\n|^)\s*\*\*\*)+$", "", body_text).strip()
 
             # Step: Turn more than one new line in a row into '***' option (before unwrap and before trailing cut)
             if should_convert_multi_nl:
@@ -1243,7 +1258,7 @@ def parse_book_file(
 
             # Normalize dividers before trailing section cutting so all section breaks are recognized
             body_text = normalize_dividers(body_text)
-            body_text = re.sub(r"(?:\n\s*\*\*\*\s*)+$", "", body_text).strip()
+            body_text = re.sub(r"(?:(?:\n|^)\s*\*\*\*)+$", "", body_text).strip()
 
             # Step: Trailing sections cut option
             ch_label = f"Chapter {ch_info['num']}"
@@ -1328,8 +1343,10 @@ def parse_book_file(
         # Cut 3: Cut End Notes / 'Notes:' section at the end of the work if present
         after_author = cut_end_notes(after_author)
 
-        # Strip any dangling trailing divider
-        after_author = re.sub(r"(?:\n\s*(?:(?:\*\s*){3,}|(?:-\s*){3,}|(?:_\s*){3,}|(?:[—–]\s*){3,})\s*)+$", "", after_author).strip()
+        # Normalize symbol-only divider lines and strip dangling start/end dividers
+        after_author = normalize_dividers(after_author)
+        after_author = re.sub(r"^(?:\*\*\*\s*(?:\n|$))+", "", after_author).strip()
+        after_author = re.sub(r"(?:(?:\n|^)\s*\*\*\*)+$", "", after_author).strip()
 
         # Step: Turn more than one new line in a row into '***' option (before unwrap and before trailing cut)
         if should_convert_multi_nl:
@@ -1337,7 +1354,7 @@ def parse_book_file(
 
         # Normalize dividers before trailing section cutting
         after_author = normalize_dividers(after_author)
-        after_author = re.sub(r"(?:\n\s*\*\*\*\s*)+$", "", after_author).strip()
+        after_author = re.sub(r"(?:(?:\n|^)\s*\*\*\*)+$", "", after_author).strip()
 
         # Step: Trailing sections cut option
         if trailing_mode == "interactive":
@@ -1469,8 +1486,8 @@ def main():
     parser.add_argument("--review-start-paragraphs", "--review-start", dest="review_start_paragraphs", action="store_true", default=False, help="Interactively preview and cut opening paragraphs (e.g. author's notes)")
     parser.add_argument("--review-end-paragraphs", "--review-end", dest="review_end_paragraphs", action="store_true", default=False, help="Interactively preview and cut closing paragraphs (e.g. author's notes)")
     parser.add_argument("--review-paragraphs", dest="review_both_paragraphs", action="store_true", default=False, help="Interactively preview and cut both opening and closing paragraphs")
-    parser.add_argument("--no-tag", dest="run_tagger", action="store_false", default=None, help="Skip dialogue tagging")
-    parser.add_argument("--tag", dest="run_tagger", action="store_true", help="Automatically trigger dialogue tagging")
+    parser.add_argument("--no-tag", "--no-tags", dest="run_tagger", action="store_false", default=None, help="Skip dialogue tagging")
+    parser.add_argument("--tag", "--tags", dest="run_tagger", action="store_true", help="Automatically trigger dialogue tagging")
     parser.add_argument("--tag-mode", "--format", dest="tag_mode", choices=["fast", "prose", "hybrid", "script"], default=None, help="Dialogue tagging engine")
     parser.add_argument("--model", "-m", dest="ollama_model", type=str, default=None, help="Ollama model name for hybrid tagging")
     parser.add_argument("--ollama-url", dest="ollama_url", type=str, default=None, help="Ollama server URL for hybrid tagging")

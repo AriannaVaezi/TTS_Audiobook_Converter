@@ -45,6 +45,7 @@ import llm_dialogue_tagger as ldt
 import local_hybrid_audioconverter as lha
 
 RAW_TXT_DIR = "raw_txt"
+RAW_EPUB_DIR = "raw_epub"
 MANIFEST_FILE = "chapters.txt"
 FINISHED_DIR = "finished"
 
@@ -61,6 +62,48 @@ def is_url(target: str) -> bool:
     return parsed.scheme in ("http", "https") and bool(parsed.netloc)
 
 
+def _resolve_local_source_path(source: str) -> str:
+    """Resolves a filename, stem, or prefix against raw_txt/ and raw_epub/ if needed."""
+    if os.path.exists(source):
+        return source
+
+    search_dirs = [d for d in (RAW_TXT_DIR, RAW_EPUB_DIR) if os.path.isdir(d)]
+    for base_dir in search_dirs:
+        candidate = os.path.join(base_dir, source)
+        if os.path.exists(candidate):
+            return candidate
+
+    ext_candidates = [
+        (RAW_TXT_DIR, ".txt"),
+        (RAW_EPUB_DIR, ".epub"),
+        (RAW_TXT_DIR, ".epub"),
+        (RAW_TXT_DIR, ".pdf"),
+    ]
+    for base_dir, suffix in ext_candidates:
+        if os.path.isdir(base_dir):
+            candidate = os.path.join(base_dir, source + suffix)
+            if os.path.exists(candidate):
+                return candidate
+
+    q_norm = source.lower().replace(" ", "_")
+    valid_exts = (".txt", ".epub", ".pdf", ".mobi", ".azw3")
+    matches = []
+    for base_dir in search_dirs:
+        for fname in os.listdir(base_dir):
+            fpath = os.path.join(base_dir, fname)
+            if (
+                os.path.isfile(fpath)
+                and not fname.startswith(".")
+                and fname.lower().endswith(valid_exts)
+                and fname.lower().replace(" ", "_").startswith(q_norm)
+            ):
+                matches.append(fpath)
+    if matches:
+        return sorted(matches, key=lambda p: os.path.getmtime(p), reverse=True)[0]
+
+    raise FileNotFoundError(f"Input file or URL not found: '{source}'")
+
+
 def ingest_input_source(
     source: str,
     reader_mode: bool = True,
@@ -68,6 +111,7 @@ def ingest_input_source(
     storage_state_file: str = None,
     interactive_login: bool = False,
     visible_browser: bool = False,
+    output_format: str = "txt",
 ) -> str:
     """
     Ingests any input source (URL, ebook, or text file) and returns the path
@@ -75,15 +119,35 @@ def ingest_input_source(
     """
     os.makedirs(RAW_TXT_DIR, exist_ok=True)
     source = source.strip().strip('"').strip("'")
+    fmt = (output_format or "txt").lower().strip()
 
     # Case 1: Web URL
     if is_url(source):
         print(f"\n[Step 1/4] Ingesting web URL via Playwright...")
         print(f"  URL: {source}")
+        if fmt == "epub":
+            epub_path = url_to_txt.scrape_url_to_txt(
+                url=source,
+                reader_mode=reader_mode,
+                headless=not (visible_browser or interactive_login),
+                output_format="epub",
+                cookies_file=cookies_file,
+                storage_state_file=storage_state_file,
+                interactive_login=interactive_login,
+            )
+            if not epub_path or not os.path.exists(epub_path):
+                raise RuntimeError(f"Web scraping to EPUB failed for URL: '{source}'")
+            print(f"[*] Converting scraped EPUB to clean text for pipeline processing...")
+            raw_txt_path = ebook_to_txt.convert_file(epub_path, apply_clean=True)
+            if not raw_txt_path or not os.path.exists(raw_txt_path):
+                raise RuntimeError(f"EPUB-to-text conversion failed for: '{epub_path}'")
+            return raw_txt_path
+
         raw_txt_path = url_to_txt.scrape_url_to_txt(
             url=source,
             reader_mode=reader_mode,
             headless=not (visible_browser or interactive_login),
+            output_format="txt",
             cookies_file=cookies_file,
             storage_state_file=storage_state_file,
             interactive_login=interactive_login,
@@ -93,25 +157,7 @@ def ingest_input_source(
         return raw_txt_path
 
     # Case 2: Local File Path
-    if not os.path.exists(source):
-        # Check if the filename exists inside raw_txt/ directly or matches a prefix
-        candidate = os.path.join(RAW_TXT_DIR, source)
-        if os.path.exists(candidate):
-            source = candidate
-        elif os.path.exists(candidate + ".txt"):
-            source = candidate + ".txt"
-        else:
-            q_norm = source.lower().replace(" ", "_")
-            matches = [
-                os.path.join(RAW_TXT_DIR, f)
-                for f in os.listdir(RAW_TXT_DIR)
-                if f.lower().endswith(".txt") and f.lower().replace(" ", "_").startswith(q_norm)
-            ]
-            if matches:
-                source = sorted(matches, key=lambda p: os.path.getmtime(p), reverse=True)[0]
-            else:
-                raise FileNotFoundError(f"Input file or URL not found: '{source}'")
-
+    source = _resolve_local_source_path(source)
     ext = os.path.splitext(source)[1].lower()
 
     # Case 2a: Ebook format (.epub, .pdf, .mobi, .azw3)
@@ -151,30 +197,37 @@ def ingest_input_source(
 
 
 def interactive_select_source() -> str:
-    """Prompts the user to enter a URL, file path, or choose from existing raw_txt files."""
+    """Prompts the user to enter a URL, file path, or choose from existing raw_txt/ or raw_epub/ files."""
     print("\nInput Source:")
     print("  Enter a web URL, ebook path (.epub/.pdf/.mobi), or text file path (.txt).")
-    raw_files = [
-        f for f in glob.glob(os.path.join(RAW_TXT_DIR, "*.txt"))
-        if os.path.isfile(f) and not os.path.basename(f).startswith(".")
-    ]
+    raw_files = []
+    for search_dir, patterns in (
+        (RAW_TXT_DIR, ("*.txt", "*.epub", "*.pdf")),
+        (RAW_EPUB_DIR, ("*.epub",)),
+    ):
+        if os.path.isdir(search_dir):
+            for pat in patterns:
+                for f in glob.glob(os.path.join(search_dir, pat)):
+                    if os.path.isfile(f) and not os.path.basename(f).startswith("."):
+                        raw_files.append(f)
+    raw_files = sorted(set(raw_files), key=lambda p: (os.path.splitext(p)[1].lower() != ".txt", os.path.basename(p).lower()))
 
     if raw_files:
-        print(f"  (Or press Enter to choose from {len(raw_files)} existing file(s) in '{RAW_TXT_DIR}/')")
+        print(f"  (Or press Enter to choose from {len(raw_files)} existing file(s) in '{RAW_TXT_DIR}/' & '{RAW_EPUB_DIR}/')")
 
     user_input = input("> ").strip()
     if user_input:
         return user_input
 
     if not raw_files:
-        print(f"[!] No existing files found in '{RAW_TXT_DIR}/'.")
+        print(f"[!] No existing files found in '{RAW_TXT_DIR}/' or '{RAW_EPUB_DIR}/'.")
         return ""
 
-    print(f"\nExisting files in '{RAW_TXT_DIR}/':")
+    print(f"\nExisting files in '{RAW_TXT_DIR}/' & '{RAW_EPUB_DIR}/':")
     for idx, fpath in enumerate(raw_files, 1):
-        bname = os.path.basename(fpath)
+        rel_disp = os.path.join(os.path.basename(os.path.dirname(fpath)), os.path.basename(fpath))
         sz_kb = os.path.getsize(fpath) / 1024
-        print(f"  [{idx:2d}] {bname:<45} ({sz_kb:6.1f} KB)")
+        print(f"  [{idx:2d}] {rel_disp:<45} ({sz_kb:6.1f} KB)")
 
     sel = input(f"\nSelect file number [1-{len(raw_files)}] (default 1): ").strip()
     try:
@@ -235,6 +288,7 @@ def run_full_pipeline(
     cut_end_paragraphs: int = 0,
     review_start_paragraphs: bool = False,
     review_end_paragraphs: bool = False,
+    output_format: str = "txt",
 ):
     """
     Executes all stages of the audiobook generator:
@@ -253,6 +307,7 @@ def run_full_pipeline(
         storage_state_file=storage_state_file,
         interactive_login=interactive_login,
         visible_browser=visible_browser,
+        output_format=output_format,
     )
     if not os.path.exists(raw_txt_path):
         print(f"[X] Error: Could not resolve raw text path: {raw_txt_path}")
@@ -376,16 +431,18 @@ def run_full_pipeline(
     return success
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Unified End-to-End Audiobook Pipeline Runner (Ingest -> Parse -> Tag -> Convert)."
-    )
-    parser.add_argument(
-        "source",
-        nargs="?",
-        default=None,
-        help="URL of web fiction or path to local file (.txt, .epub, .pdf, .mobi).",
-    )
+def add_pipeline_arguments(
+    parser: argparse.ArgumentParser,
+    include_source: bool = True,
+) -> argparse.ArgumentParser:
+    """Registers all unified pipeline CLI arguments onto the given parser."""
+    if include_source:
+        parser.add_argument(
+            "source",
+            nargs="?",
+            default=None,
+            help="URL of web fiction or path to local file (.txt, .epub, .pdf, .mobi).",
+        )
     parser.add_argument(
         "--reader",
         dest="reader_mode",
@@ -428,14 +485,28 @@ def main():
         help="Path to Playwright storage state file (default: .playwright_auth.json).",
     )
     parser.add_argument(
-        "--tag",
+        "--epub",
+        dest="output_format",
+        action="store_const",
+        const="epub",
+        help="When scraping a URL, save as .epub in raw_epub/ first and convert to clean text.",
+    )
+    parser.add_argument(
+        "--format",
+        dest="output_format",
+        choices=["txt", "epub"],
+        help="Intermediate scrape format for URL inputs: txt (default) or epub.",
+    )
+    parser.set_defaults(output_format="txt")
+    parser.add_argument(
+        "--tag", "--tags",
         dest="tag_dialogue",
         action="store_true",
         default=None,
         help="Enable automatic dialogue tagging (default: enabled).",
     )
     parser.add_argument(
-        "--no-tag",
+        "--no-tag", "--no-tags",
         dest="tag_dialogue",
         action="store_false",
         help="Skip automatic dialogue tagging (renders clean narrator voice throughout).",
@@ -803,8 +874,22 @@ def main():
         default=False,
         help="Run non-interactively using defaults for all unspecified options.",
     )
+    return parser
 
-    args = parser.parse_args()
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Unified End-to-End Audiobook Pipeline Runner (Ingest -> Parse -> Tag -> Convert)."
+    )
+    return add_pipeline_arguments(parser, include_source=True)
+
+
+def run_from_args(
+    args: argparse.Namespace,
+    source_override: str = None,
+    interactive_login_override: bool = None,
+) -> bool:
+    """Resolves parsed CLI options and invokes run_full_pipeline()."""
     if args.random_narrator is True or any(
         val is not None for val in (args.narrator_gender, args.narrator_accent, args.narrator_voices)
     ):
@@ -814,7 +899,7 @@ def main():
     else:
         use_random_narrator = None
 
-    source = args.source
+    source = source_override if source_override is not None else getattr(args, "source", None)
     is_interactive = bool(args.interactive)
     if not source:
         if not args.non_interactive:
@@ -823,7 +908,7 @@ def main():
         source = interactive_select_source()
         if not source:
             print("[!] No input source provided. Exiting.")
-            sys.exit(0)
+            return False
 
     review_start_paragraphs = bool(args.review_start_paragraphs or args.review_both_paragraphs)
     review_end_paragraphs = bool(args.review_end_paragraphs or args.review_both_paragraphs)
@@ -879,14 +964,14 @@ def main():
         ):
             p_ans = input("  Trim opening/closing paragraphs (e.g. author's notes)? [1=No (default), 2=Interactive review, 3=Bulk cut]: ").strip()
             if p_ans == "2":
-                 side_ans = input("    Review which paragraphs? [1=Both (default), 2=Opening only, 3=Closing only]: ").strip()
-                 if side_ans == "2":
-                     review_start_paragraphs = True
-                 elif side_ans == "3":
-                     review_end_paragraphs = True
-                 else:
-                     review_start_paragraphs = True
-                     review_end_paragraphs = True
+                side_ans = input("    Review which paragraphs? [1=Both (default), 2=Opening only, 3=Closing only]: ").strip()
+                if side_ans == "2":
+                    review_start_paragraphs = True
+                elif side_ans == "3":
+                    review_end_paragraphs = True
+                else:
+                    review_start_paragraphs = True
+                    review_end_paragraphs = True
             elif p_ans == "3":
                 raw_s = input("    Number of paragraphs to cut from the start (default 0): ").strip()
                 raw_e = input("    Number of paragraphs to cut from the end (default 0): ").strip()
@@ -923,8 +1008,13 @@ def main():
             print(f"[*] Appending to existing book: '{append_to_book}'")
 
     only_new = False if args.all_chapters else (True if args.only_new else None)
+    use_login = (
+        interactive_login_override
+        if interactive_login_override is not None
+        else args.interactive_login
+    )
 
-    run_full_pipeline(
+    return bool(run_full_pipeline(
         source=source,
         tag_dialogue=tag_dialogue,
         tag_mode=args.tag_mode,
@@ -967,13 +1057,20 @@ def main():
         reset_chunks=args.reset_chunks,
         cookies_file=args.cookies_file,
         storage_state_file=args.storage_state_file,
-        interactive_login=args.interactive_login,
+        interactive_login=use_login,
         visible_browser=args.visible_browser,
         cut_start_paragraphs=cut_start_paragraphs,
         cut_end_paragraphs=cut_end_paragraphs,
         review_start_paragraphs=review_start_paragraphs,
         review_end_paragraphs=review_end_paragraphs,
-    )
+        output_format=getattr(args, "output_format", "txt"),
+    ))
+
+
+def main(argv=None):
+    parser = build_arg_parser()
+    args = parser.parse_args(argv)
+    return run_from_args(args)
 
 
 if __name__ == "__main__":

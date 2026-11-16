@@ -36,6 +36,7 @@ An automated text-to-speech (TTS) pipeline designed for creating audiobooks with
 ```text
 TTS_Audiobook_Converter/
 ├── run_pipeline.py                 # ⭐ UNIFIED PIPELINE: Ingest -> Parse -> Tag -> Convert (All-in-One)
+├── batch_run_pipeline.py           # Batch runner for run_pipeline.py (URLs, EPUBs, folders, lists)
 │
 ├── Ingestion Tools:
 │   ├── url_to_txt.py               # Playwright web scraper for web fiction & chapters (.txt or .epub)
@@ -49,6 +50,7 @@ TTS_Audiobook_Converter/
 │
 ├── Workspace & Storage:
 │   ├── raw_txt/                    # Source story/book text files
+│   ├── raw_epub/                   # Downloaded/source EPUB ebooks
 │   ├── parsed_chapters/            # Chapters split and cleaned by new_text_parser.py
 │   ├── tagged_chapters/            # Chapters tagged with character and emotion markers
 │   ├── wavs/                       # Custom reference voice WAV samples for F5-TTS cloning
@@ -112,8 +114,13 @@ python run_pipeline.py "https://archiveofourown.org/works/12345"
 # From a local text file:
 python run_pipeline.py raw_txt/my_story.txt
 
-# From an EPUB or PDF ebook:
+# From an EPUB or PDF ebook (by full path or filename/stem inside raw_epub/):
 python run_pipeline.py "C:\Books\my_book.epub"
+python run_pipeline.py raw_epub/my_book.epub --no-tags --new-book
+
+# Batch run across a URL/file list (e.g. url_file\urls.txt) or folder of EPUBs/TXTs:
+python batch_run_pipeline.py url_file\urls.txt --no-tags --new-book --keep-narrator
+python batch_run_pipeline.py raw_epub --no-tags --new-book --keep-narrator
 
 # Append new chapter(s) to an existing book (renders only new chapters & updates the full audiobook):
 python run_pipeline.py "https://archiveofourown.org/works/12345/chapters/67890" --append-to "My_Story_Title"

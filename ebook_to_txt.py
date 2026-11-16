@@ -80,12 +80,22 @@ def epub_to_txt(epub_path: str, output_name: str = None, apply_clean: bool = Tru
         print(f"[X] Failed to read EPUB: {e}")
         return None
 
-    # Determine output filename: prefer book title, fallback to file stem
+    # Determine title, author, and output filename: prefer book title, fallback to file stem
     title = None
     try:
         title_meta = book.get_metadata("DC", "title")
-        if title_meta:
-            title = title_meta[0][0]
+        if title_meta and title_meta[0][0]:
+            title = str(title_meta[0][0]).strip()
+    except Exception:
+        pass
+
+    author = None
+    try:
+        creator_meta = book.get_metadata("DC", "creator")
+        if creator_meta and creator_meta[0][0]:
+            cand_author = str(creator_meta[0][0]).strip()
+            if cand_author and cand_author.lower() != "unknown":
+                author = cand_author
     except Exception:
         pass
 
@@ -96,13 +106,17 @@ def epub_to_txt(epub_path: str, output_name: str = None, apply_clean: bool = Tru
     for item in book.get_items_of_type(ebooklib.ITEM_DOCUMENT):
         soup = BeautifulSoup(item.get_content(), "html.parser")
 
-        # Remove nav, scripts, styles
+        # Remove nav, scripts, styles, and injected source URL lines
         for tag in soup(["script", "style", "nav", "head"]):
             tag.decompose()
+        for src_p in soup.find_all("p", class_="source-url"):
+            src_p.decompose()
 
-        # Convert <br> to newlines
+        # Convert <br> to newlines and <hr> to *** scene dividers
         for br in soup.find_all("br"):
             br.replace_with("\n")
+        for hr in soup.find_all("hr"):
+            hr.replace_with("\n\n***\n\n")
 
         # Add double newlines around block elements for paragraph separation
         for tag in soup.find_all(["p", "div", "h1", "h2", "h3", "h4",
@@ -113,13 +127,31 @@ def epub_to_txt(epub_path: str, output_name: str = None, apply_clean: bool = Tru
         part_text = soup.get_text(separator="")
         part_text = re.sub(r"\n{3,}", "\n\n", part_text).strip()
 
-        if len(part_text) > 50:
+        if len(part_text) > 0:
             all_text_parts.append(part_text)
 
     full_text = "\n\n".join(all_text_parts)
 
     if apply_clean:
         full_text = clean_prose_text(full_text)
+
+    # Ensure EPUB metadata Title / Author appear cleanly at the top for new_text_parser.py
+    if title:
+        lines = full_text.splitlines()
+        first_non_empty_idx = next((idx for idx, ln in enumerate(lines) if ln.strip()), None)
+        if first_non_empty_idx is not None and lines[first_non_empty_idx].strip().lower() == title.lower():
+            remaining = "\n".join(lines[first_non_empty_idx + 1:]).lstrip()
+        else:
+            remaining = full_text
+
+        top_block = "\n".join(ln.strip() for ln in remaining.splitlines()[:10] if ln.strip())
+        has_author_header = bool(
+            author and re.search(rf"(?im)^(?:by:?\s+){re.escape(author)}\s*$", top_block)
+        )
+        if author and not has_author_header:
+            full_text = f"{title}\nby {author}\n\n{remaining}".strip()
+        else:
+            full_text = f"{title}\n\n{remaining}".strip()
 
     if len(full_text) < 100:
         print("[!] Warning: Extracted text is very short. The EPUB may be image-based or DRM-protected.")
@@ -190,16 +222,21 @@ def pdf_to_txt(pdf_path: str, output_name: str = None, apply_clean: bool = True)
 # ==================== SHARED HELPERS ====================
 
 def _save_to_raw_txt(text: str, base_name: str) -> str:
-    """Saves text to raw_txt/, avoiding overwrite of existing files."""
+    """Saves converted text to raw_txt/, reusing or updating existing matching output cleanly."""
     os.makedirs(RAW_TXT_DIR, exist_ok=True)
     output_path = os.path.join(RAW_TXT_DIR, f"{base_name}.txt")
 
-    # Avoid overwriting by adding a suffix counter
-    counter = 1
-    stem = output_path
-    while os.path.exists(output_path) and os.path.getsize(output_path) > 0:
-        output_path = stem.replace(".txt", f"_{counter}.txt")
-        counter += 1
+    if os.path.exists(output_path):
+        try:
+            with open(output_path, "r", encoding="utf-8") as existing_f:
+                if existing_f.read() == text:
+                    char_count = len(text)
+                    word_count = len(text.split())
+                    print(f"\n[+] Using up-to-date text: {output_path}")
+                    print(f"    {char_count:,} characters | ~{word_count:,} words")
+                    return output_path
+        except Exception:
+            pass
 
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(text)

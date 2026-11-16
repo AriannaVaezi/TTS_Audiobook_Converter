@@ -189,9 +189,11 @@ def html_to_clean_text(html_content: str) -> str:
                      "aside", "button", "form", "iframe", "noscript"]):
         tag.decompose()
 
-    # Convert <br> -> newline markers before stripping
+    # Convert <br> -> newline markers and <hr> -> *** scene dividers before stripping
     for br in soup.find_all("br"):
         br.replace_with("\n")
+    for hr in soup.find_all("hr"):
+        hr.replace_with("\n\n***\n\n")
 
     # Convert block-level elements to double-newline paragraph breaks
     block_tags = ["p", "div", "h1", "h2", "h3", "h4", "h5", "h6",
